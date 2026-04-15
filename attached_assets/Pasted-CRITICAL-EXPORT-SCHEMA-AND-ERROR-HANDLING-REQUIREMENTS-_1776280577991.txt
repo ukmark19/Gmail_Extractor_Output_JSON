@@ -1,0 +1,365 @@
+CRITICAL EXPORT SCHEMA AND ERROR-HANDLING REQUIREMENTS
+
+Design the export layer so that it is genuinely suitable for ChatGPT custom GPT knowledge ingestion, embedding pipelines, and later reprocessing. Nothing should be silently omitted. If any attachment, body, or field cannot be extracted, that failure must be preserved in the export in a clear, structured way.
+
+PRIMARY RULE
+Every exported email record must contain:
+1. core email metadata
+2. normalized email body content
+3. all attachment metadata
+4. extracted attachment content where readable
+5. explicit error and warning records where content could not be extracted
+6. a merged AI-ready content field for ingestion
+7. provenance fields linking all content back to the source email and attachment
+
+DO NOT silently skip unreadable, encrypted, corrupted, or unsupported files.
+If extraction fails, the export must explicitly state:
+- what file failed
+- why it failed
+- whether the failure is likely due to encryption/security/protection/corruption/unsupported type/size limit/OCR limitation
+- whether retry may succeed after user action
+
+REQUIRED EXPORT FORMATS
+
+Implement these 3 export outputs:
+
+1. full_export.json
+- structured hierarchical export of emails plus attachments
+
+2. ai_ingestion.jsonl
+- one ingestion-ready object per email or email-content chunk
+- attachment content included in normalized form
+
+3. export_manifest.json
+- summary of everything exported, extracted, skipped, failed, unsupported, and partially processed
+
+REQUIRED TOP-LEVEL EMAIL EXPORT SCHEMA
+
+Each exported email object must follow this structure:
+
+{
+  "record_type": "gmail_email",
+  "export_version": "1.0",
+  "exported_at": "ISO-8601 timestamp",
+  "query_context": {
+    "generated_gmail_query": "...",
+    "search_filters": {
+      "keywords": "...",
+      "from": "...",
+      "to": "...",
+      "date_from": "...",
+      "date_to": "...",
+      "all_dates": true
+    }
+  },
+  "email": {
+    "id": "...",
+    "thread_id": "...",
+    "subject": "...",
+    "from": "...",
+    "to": ["..."],
+    "cc": ["..."],
+    "bcc": ["..."],
+    "reply_to": "...",
+    "date_header": "...",
+    "internal_date": "...",
+    "snippet": "...",
+    "labels": ["..."],
+    "has_attachments": true,
+    "attachment_count": 3,
+    "message_size_estimate": 123456
+  },
+  "body": {
+    "plain_text": "...",
+    "html_stripped_text": "...",
+    "html_original_available": true,
+    "body_extraction_status": "success | partial | failed",
+    "body_errors": []
+  },
+  "attachments": [
+    {
+      "attachment_id": "...",
+      "message_id": "...",
+      "part_id": "...",
+      "filename": "...",
+      "mime_type": "...",
+      "file_extension": "...",
+      "size_bytes": 12345,
+      "content_id": "...",
+      "is_inline": false,
+      "is_supported": true,
+      "was_downloaded": true,
+      "extraction_status": "success | partial | failed | unsupported | skipped",
+      "skip_reason": null,
+      "failure_category": null,
+      "failure_detail": null,
+      "user_action_needed": null,
+      "extraction_method": "pdf_parser | docx_parser | xlsx_parser | csv_parser | json_parser | xml_parser | html_to_text | ocr | none",
+      "text_quality": "high | medium | low | unknown",
+      "contains_structured_data": true,
+      "structured_data_type": "table | spreadsheet | json | xml | none",
+      "page_count": 10,
+      "sheet_names": ["Sheet1", "Sheet2"],
+      "extracted_text": "...",
+      "structured_data": {},
+      "warnings": [],
+      "errors": []
+    }
+  ],
+  "content_for_ai": {
+    "combined_text": "...",
+    "chunking_strategy": "none | page | heading | fixed",
+    "chunks": [
+      {
+        "chunk_id": "...",
+        "source_type": "email_body | attachment",
+        "source_name": "body | filename.pdf",
+        "attachment_id": null,
+        "page_or_section": "...",
+        "text": "...",
+        "token_estimate": 500
+      }
+    ]
+  },
+  "processing_summary": {
+    "email_body_processed": true,
+    "attachments_detected": 3,
+    "attachments_extracted_successfully": 2,
+    "attachments_failed": 1,
+    "attachments_unsupported": 0,
+    "attachments_skipped": 0,
+    "processing_warnings": [],
+    "processing_errors": []
+  }
+}
+
+MANDATORY AI-INGESTION JSONL FORMAT
+
+Create a second export called ai_ingestion.jsonl.
+
+This must be optimized for ChatGPT/custom GPT/embedding workflows.
+
+Each JSONL line should be one chunk or one document unit with this structure:
+
+{
+  "document_id": "gmail_<messageid>_chunk_001",
+  "record_type": "gmail_ingestion_chunk",
+  "source": "gmail",
+  "source_email_id": "...",
+  "source_thread_id": "...",
+  "source_attachment_id": "...",
+  "source_attachment_filename": "...",
+  "source_component": "email_body | attachment",
+  "subject": "...",
+  "from": "...",
+  "to": ["..."],
+  "date": "...",
+  "labels": ["..."],
+  "mime_type": "...",
+  "chunk_index": 1,
+  "chunk_total": 4,
+  "text": "...",
+  "metadata": {
+    "query_used": "...",
+    "extraction_method": "...",
+    "text_quality": "...",
+    "page_or_sheet": "...",
+    "had_extraction_error": false
+  }
+}
+
+MANDATORY MANIFEST FORMAT
+
+Create export_manifest.json with:
+
+{
+  "export_version": "1.0",
+  "exported_at": "ISO-8601 timestamp",
+  "query_used": "...",
+  "email_count": 100,
+  "email_body_success_count": 98,
+  "email_body_failure_count": 2,
+  "attachment_count_total": 240,
+  "attachment_supported_count": 210,
+  "attachment_unsupported_count": 30,
+  "attachment_extracted_success_count": 180,
+  "attachment_partial_count": 12,
+  "attachment_failure_count": 18,
+  "attachment_skipped_count": 0,
+  "failure_breakdown": {
+    "encrypted_or_password_protected": 4,
+    "corrupt_or_malformed": 3,
+    "unsupported_file_type": 30,
+    "too_large": 2,
+    "ocr_failed": 5,
+    "parser_error": 4
+  },
+  "emails_with_any_errors": ["messageid1", "messageid2"],
+  "attachments_requiring_user_action": [
+    {
+      "message_id": "...",
+      "attachment_id": "...",
+      "filename": "secure-report.pdf",
+      "reason": "Password protected or encrypted PDF could not be read",
+      "suggested_user_action": "Remove password/security restrictions and rerun extraction"
+    }
+  ]
+}
+
+MANDATORY FAILURE CATEGORIES
+
+Every failed or partial attachment extraction must classify into one of these categories:
+
+- unsupported_file_type
+- encrypted_or_password_protected
+- corrupt_or_malformed
+- empty_file
+- too_large
+- extraction_timeout
+- parser_error
+- ocr_failed
+- network_fetch_error
+- permission_error
+- unknown_error
+
+MANDATORY USER-ACTION MESSAGES
+
+Where possible, provide an actionable message for the user.
+
+Examples:
+- "Password protected PDF could not be opened. Remove the password or export an unsecured copy and rerun."
+- "Scanned image quality too poor for OCR. Provide a cleaner scan or higher-resolution image."
+- "Spreadsheet is corrupted or unreadable. Open and resave the file in Excel, then rerun."
+- "Attachment type .msg is not yet supported for text extraction. Raw metadata exported only."
+- "Attachment exceeded configured size limit and was skipped. Increase max size or process manually."
+
+MANDATORY LOGGING REQUIREMENTS
+
+Build a proper processing log system. Do not rely on vague console messages only.
+
+The system must produce:
+1. UI-visible extraction status per email and per attachment
+2. downloadable processing log file
+3. structured error objects in export output
+4. server-side logs with enough detail for debugging
+
+For each processing event, log:
+- timestamp
+- message_id
+- attachment_id if applicable
+- filename if applicable
+- event_type
+- status
+- extraction_method
+- duration_ms
+- error_category
+- error_message
+- user_action_needed
+
+Suggested event types:
+- email_fetch_started
+- email_fetch_completed
+- attachment_detected
+- attachment_download_started
+- attachment_download_completed
+- attachment_extraction_started
+- attachment_extraction_completed
+- attachment_extraction_failed
+- export_record_written
+- export_completed
+
+REQUIRED UI FEEDBACK
+
+In the app UI:
+- show attachment extraction status for each attachment
+- show failure badge if any attachment failed
+- provide hover or detail view with exact reason
+- clearly distinguish:
+  - unsupported
+  - encrypted/protected
+  - corrupted
+  - OCR poor quality
+  - skipped due to size/settings
+
+Add a “Problems / Warnings” panel in the export review screen showing:
+- unreadable attachments
+- protected files
+- unsupported file types
+- skipped oversized files
+- partial OCR results
+
+MANDATORY SECURE/PROTECTED FILE HANDLING
+
+If a file cannot be read due to security/protection:
+- do not fail silently
+- do not mark it as generic parser failure if you can detect protection
+- classify it specifically as encrypted_or_password_protected
+- include filename and attachment metadata
+- include clear suggested next step:
+  "Remove security/password restrictions and rerun extraction."
+
+MANDATORY CONTENT MERGING RULE
+
+For AI use, every exported email must contain a merged text field that combines:
+1. normalized email body
+2. extracted attachment text from all readable attachments
+3. clear separators between sections
+
+Example structure of combined_text:
+
+EMAIL SUBJECT: ...
+FROM: ...
+TO: ...
+DATE: ...
+
+EMAIL BODY:
+...
+
+ATTACHMENT: contract.pdf
+TYPE: application/pdf
+EXTRACTION STATUS: success
+CONTENT:
+...
+
+ATTACHMENT: secure-financials.xlsx
+TYPE: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+EXTRACTION STATUS: failed
+REASON: Password protected or encrypted spreadsheet could not be read.
+USER ACTION: Remove file protection and rerun extraction.
+
+This combined_text must never omit attachment failures. Even unreadable files must be represented in text form as failure notices so the downstream AI context reflects that something was attached but unreadable.
+
+MANDATORY NO-SILENT-LOSS RULE
+
+No email or attachment content may be silently dropped.
+If something cannot be read, exported output must still preserve:
+- metadata
+- failure category
+- reason
+- user action required
+
+MANDATORY TEST CASES
+
+Add automated or semi-automated tests for:
+- readable PDF attachment
+- password-protected PDF
+- corrupted PDF
+- readable XLSX
+- protected XLSX
+- CSV with headers
+- DOCX extraction
+- image OCR success
+- image OCR failure
+- unsupported attachment type
+- oversized file skipped
+- export manifest correctness
+- combined_text includes failure notices
+
+FINAL IMPLEMENTATION RULE
+
+The export is not complete unless:
+- every email includes attachment records
+- every attachment has a clear status
+- every failure is logged and exported
+- AI-ready merged text includes both successful content and clear failure notices
+- the user can tell exactly what needs manual intervention

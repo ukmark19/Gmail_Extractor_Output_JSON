@@ -5,16 +5,14 @@
  * Gmail Query Exporter API specification
  * OpenAPI spec version: 0.1.0
  */
-import type { ExportEmailsBodyFormat } from "./exportEmailsBodyFormat";
+import type { ExportEmailsBodySearchFilters } from "./exportEmailsBodySearchFilters";
 
 export interface ExportEmailsBody {
   /** IDs of messages to export */
   messageIds: string[];
-  /** Export format */
-  format: ExportEmailsBodyFormat;
   /** The search query that produced these results */
   queryUsed?: string;
-  includeManifest?: boolean;
   chunkLargeBodies?: boolean;
-  splitFiles?: boolean;
+  /** Structured search filters used for this export */
+  searchFilters?: ExportEmailsBodySearchFilters;
 }

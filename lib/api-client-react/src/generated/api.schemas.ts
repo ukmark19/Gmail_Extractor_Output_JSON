@@ -127,45 +127,60 @@ export interface LabelsResponse {
 }
 
 /**
- * Export format
+ * Structured search filters used for this export
  */
-export type ExportEmailsBodyFormat =
-  (typeof ExportEmailsBodyFormat)[keyof typeof ExportEmailsBodyFormat];
-
-export const ExportEmailsBodyFormat = {
-  raw: "raw",
-  "ai-optimized": "ai-optimized",
-  jsonl: "jsonl",
-} as const;
+export type ExportEmailsBodySearchFilters = { [key: string]: unknown };
 
 export interface ExportEmailsBody {
   /** IDs of messages to export */
   messageIds: string[];
-  /** Export format */
-  format: ExportEmailsBodyFormat;
   /** The search query that produced these results */
   queryUsed?: string;
-  includeManifest?: boolean;
   chunkLargeBodies?: boolean;
-  splitFiles?: boolean;
+  /** Structured search filters used for this export */
+  searchFilters?: ExportEmailsBodySearchFilters;
 }
 
+export type ExportEmailsResponseFullExportItem = { [key: string]: unknown };
+
+export type ExportEmailsResponseProcessingLogItem = { [key: string]: unknown };
+
+export type ExportManifestFailureBreakdown = { [key: string]: unknown };
+
+export type ExportManifestAttachmentsRequiringUserActionItem = {
+  [key: string]: unknown;
+};
+
 export interface ExportManifest {
-  exportId: string;
-  exportTimestamp: string;
-  format: string;
-  count: number;
-  queryUsed?: string;
-  messageIds?: string[];
+  export_id: string;
+  exported_at: string;
+  export_version?: string;
+  query_used?: string;
+  email_count: number;
+  email_body_success_count?: number;
+  email_body_failure_count?: number;
+  attachment_count_total?: number;
+  attachment_extracted_success_count?: number;
+  attachment_failure_count?: number;
+  attachment_unsupported_count?: number;
+  attachment_skipped_count?: number;
+  failure_breakdown?: ExportManifestFailureBreakdown;
+  emails_with_any_errors?: string[];
+  attachments_requiring_user_action?: ExportManifestAttachmentsRequiringUserActionItem[];
 }
 
 export interface ExportEmailsResponse {
-  /** Exported data (format depends on format field) */
-  data: unknown;
-  manifest?: ExportManifest;
+  exportId: string;
+  exportedAt: string;
   format: string;
   count: number;
-  exportId: string;
+  /** Structured hierarchical export of emails plus attachments */
+  fullExport: ExportEmailsResponseFullExportItem[];
+  /** JSONL string — one ingestion-ready object per chunk */
+  aiIngestion: string;
+  manifest: ExportManifest;
+  /** Structured processing log entries */
+  processingLog?: ExportEmailsResponseProcessingLogItem[];
 }
 
 export interface SavedSearch {

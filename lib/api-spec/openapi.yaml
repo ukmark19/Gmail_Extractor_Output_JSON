@@ -510,67 +510,95 @@ components:
           items:
             type: string
           description: IDs of messages to export
-        format:
-          type: string
-          enum: [raw, ai-optimized, jsonl]
-          description: Export format
         queryUsed:
           type: string
           description: The search query that produced these results
-        includeManifest:
-          type: boolean
-          default: true
         chunkLargeBodies:
           type: boolean
           default: false
-        splitFiles:
-          type: boolean
-          default: false
+        searchFilters:
+          type: object
+          description: Structured search filters used for this export
+          additionalProperties: true
       required:
         - messageIds
-        - format
 
     ExportEmailsResponse:
       type: object
       properties:
-        data:
-          description: Exported data (format depends on format field)
-        manifest:
-          $ref: "#/components/schemas/ExportManifest"
+        exportId:
+          type: string
+        exportedAt:
+          type: string
         format:
           type: string
         count:
           type: integer
-        exportId:
+        fullExport:
+          type: array
+          description: Structured hierarchical export of emails plus attachments
+          items:
+            type: object
+        aiIngestion:
           type: string
+          description: JSONL string — one ingestion-ready object per chunk
+        manifest:
+          $ref: "#/components/schemas/ExportManifest"
+        processingLog:
+          type: array
+          description: Structured processing log entries
+          items:
+            type: object
       required:
-        - data
+        - exportId
+        - exportedAt
         - format
         - count
-        - exportId
+        - fullExport
+        - aiIngestion
+        - manifest
 
     ExportManifest:
       type: object
       properties:
-        exportId:
+        export_id:
           type: string
-        exportTimestamp:
+        exported_at:
           type: string
-        format:
+        export_version:
           type: string
-        count:
+        query_used:
+          type: string
+        email_count:
           type: integer
-        queryUsed:
-          type: string
-        messageIds:
+        email_body_success_count:
+          type: integer
+        email_body_failure_count:
+          type: integer
+        attachment_count_total:
+          type: integer
+        attachment_extracted_success_count:
+          type: integer
+        attachment_failure_count:
+          type: integer
+        attachment_unsupported_count:
+          type: integer
+        attachment_skipped_count:
+          type: integer
+        failure_breakdown:
+          type: object
+        emails_with_any_errors:
           type: array
           items:
             type: string
+        attachments_requiring_user_action:
+          type: array
+          items:
+            type: object
       required:
-        - exportId
-        - exportTimestamp
-        - format
-        - count
+        - export_id
+        - exported_at
+        - email_count
 
     SavedSearch:
       type: object

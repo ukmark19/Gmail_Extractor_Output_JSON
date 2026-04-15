@@ -5,12 +5,23 @@
  * Gmail Query Exporter API specification
  * OpenAPI spec version: 0.1.0
  */
+import type { ExportManifestAttachmentsRequiringUserActionItem } from "./exportManifestAttachmentsRequiringUserActionItem";
+import type { ExportManifestFailureBreakdown } from "./exportManifestFailureBreakdown";
 
 export interface ExportManifest {
-  exportId: string;
-  exportTimestamp: string;
-  format: string;
-  count: number;
-  queryUsed?: string;
-  messageIds?: string[];
+  export_id: string;
+  exported_at: string;
+  export_version?: string;
+  query_used?: string;
+  email_count: number;
+  email_body_success_count?: number;
+  email_body_failure_count?: number;
+  attachment_count_total?: number;
+  attachment_extracted_success_count?: number;
+  attachment_failure_count?: number;
+  attachment_unsupported_count?: number;
+  attachment_skipped_count?: number;
+  failure_breakdown?: ExportManifestFailureBreakdown;
+  emails_with_any_errors?: string[];
+  attachments_requiring_user_action?: ExportManifestAttachmentsRequiringUserActionItem[];
 }

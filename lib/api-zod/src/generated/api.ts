@@ -158,43 +158,57 @@ export const GetLabelsResponse = zod.object({
 /**
  * @summary Export selected email messages to JSON
  */
-export const exportEmailsBodyIncludeManifestDefault = true;
 export const exportEmailsBodyChunkLargeBodiesDefault = false;
-export const exportEmailsBodySplitFilesDefault = false;
 
 export const ExportEmailsBody = zod.object({
   messageIds: zod.array(zod.string()).describe("IDs of messages to export"),
-  format: zod.enum(["raw", "ai-optimized", "jsonl"]).describe("Export format"),
   queryUsed: zod
     .string()
     .optional()
     .describe("The search query that produced these results"),
-  includeManifest: zod
-    .boolean()
-    .default(exportEmailsBodyIncludeManifestDefault),
   chunkLargeBodies: zod
     .boolean()
     .default(exportEmailsBodyChunkLargeBodiesDefault),
-  splitFiles: zod.boolean().default(exportEmailsBodySplitFilesDefault),
+  searchFilters: zod
+    .record(zod.string(), zod.unknown())
+    .optional()
+    .describe("Structured search filters used for this export"),
 });
 
 export const ExportEmailsResponse = zod.object({
-  data: zod
-    .unknown()
-    .describe("Exported data (format depends on format field)"),
-  manifest: zod
-    .object({
-      exportId: zod.string(),
-      exportTimestamp: zod.string(),
-      format: zod.string(),
-      count: zod.number(),
-      queryUsed: zod.string().optional(),
-      messageIds: zod.array(zod.string()).optional(),
-    })
-    .optional(),
+  exportId: zod.string(),
+  exportedAt: zod.string(),
   format: zod.string(),
   count: zod.number(),
-  exportId: zod.string(),
+  fullExport: zod
+    .array(zod.object({}).passthrough())
+    .describe("Structured hierarchical export of emails plus attachments"),
+  aiIngestion: zod
+    .string()
+    .describe("JSONL string — one ingestion-ready object per chunk"),
+  manifest: zod.object({
+    export_id: zod.string(),
+    exported_at: zod.string(),
+    export_version: zod.string().optional(),
+    query_used: zod.string().optional(),
+    email_count: zod.number(),
+    email_body_success_count: zod.number().optional(),
+    email_body_failure_count: zod.number().optional(),
+    attachment_count_total: zod.number().optional(),
+    attachment_extracted_success_count: zod.number().optional(),
+    attachment_failure_count: zod.number().optional(),
+    attachment_unsupported_count: zod.number().optional(),
+    attachment_skipped_count: zod.number().optional(),
+    failure_breakdown: zod.object({}).passthrough().optional(),
+    emails_with_any_errors: zod.array(zod.string()).optional(),
+    attachments_requiring_user_action: zod
+      .array(zod.object({}).passthrough())
+      .optional(),
+  }),
+  processingLog: zod
+    .array(zod.object({}).passthrough())
+    .optional()
+    .describe("Structured processing log entries"),
 });
 
 /**

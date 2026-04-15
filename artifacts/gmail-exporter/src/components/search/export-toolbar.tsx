@@ -1,9 +1,7 @@
-import { useExportEmails, ExportEmailsBodyFormat, getGetExportLogsQueryKey } from "@workspace/api-client-react";
+import { useExportEmails, getGetExportLogsQueryKey } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Download, Loader2, X, FileJson } from "lucide-react";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Label } from "@/components/ui/label";
+import { Download, Loader2, X, FileArchive, CheckCircle2 } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
 import { useState } from "react";
 import { useToast } from "@/hooks/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
@@ -12,71 +10,128 @@ interface ExportToolbarProps {
   selectedCount: number;
   selectedMessageIds: string[];
   queryUsed?: string;
+  searchFilters?: Record<string, unknown>;
   onClearSelection: () => void;
+  onExportComplete?: (result: ExportResult) => void;
 }
 
-export function ExportToolbar({ selectedCount, selectedMessageIds, queryUsed, onClearSelection }: ExportToolbarProps) {
+export interface ExportResult {
+  manifest: {
+    export_id: string;
+    exported_at: string;
+    email_count: number;
+    attachment_count_total: number;
+    attachment_extracted_success_count: number;
+    attachment_failure_count: number;
+    attachment_unsupported_count: number;
+    attachment_skipped_count: number;
+    email_body_failure_count: number;
+    failure_breakdown: Record<string, number>;
+    emails_with_any_errors: string[];
+    attachments_requiring_user_action: Array<{
+      message_id: string;
+      attachment_id: string;
+      filename: string;
+      reason: string;
+      suggested_user_action: string;
+    }>;
+  };
+}
+
+function downloadBlob(content: string, filename: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  window.URL.revokeObjectURL(url);
+  document.body.removeChild(a);
+}
+
+export function ExportToolbar({
+  selectedCount,
+  selectedMessageIds,
+  queryUsed,
+  searchFilters,
+  onClearSelection,
+  onExportComplete,
+}: ExportToolbarProps) {
   const exportEmails = useExportEmails();
   const { toast } = useToast();
   const queryClient = useQueryClient();
-
-  const [format, setFormat] = useState<ExportEmailsBodyFormat>(ExportEmailsBodyFormat["ai-optimized"]);
-  const [includeManifest, setIncludeManifest] = useState(true);
-  const [chunkLargeBodies, setChunkLargeBodies] = useState(true);
-  const [splitFiles, setSplitFiles] = useState(false);
+  const [lastExportId, setLastExportId] = useState<string | null>(null);
 
   const handleExport = () => {
     if (selectedMessageIds.length === 0) return;
 
-    exportEmails.mutate({
-      data: {
-        messageIds: selectedMessageIds,
-        format,
-        queryUsed,
-        includeManifest,
-        chunkLargeBodies,
-        splitFiles
-      }
-    }, {
-      onSuccess: (response) => {
-        toast({ description: `Successfully exported ${response.count} emails.` });
-        queryClient.invalidateQueries({ queryKey: getGetExportLogsQueryKey() });
-
-        try {
-          let content: string;
-          let filenameExt: string;
-          let mimeType: string;
-
-          if (format === 'jsonl') {
-            // Assume data is already a string of JSONL or array of strings
-            content = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-            filenameExt = "jsonl";
-            mimeType = "application/x-ndjson";
-          } else {
-            // Format is json
-            content = JSON.stringify(response, null, 2);
-            filenameExt = "json";
-            mimeType = "application/json";
-          }
-
-          const blob = new Blob([content], { type: mimeType });
-          const url = window.URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `gmail-export-${format}-${Date.now()}.${filenameExt}`;
-          document.body.appendChild(a);
-          a.click();
-          window.URL.revokeObjectURL(url);
-          document.body.removeChild(a);
-        } catch (err) {
-          console.error("Failed to trigger download:", err);
-          toast({ variant: "destructive", description: "Failed to download file." });
-        }
+    exportEmails.mutate(
+      {
+        data: {
+          messageIds: selectedMessageIds,
+          queryUsed,
+          chunkLargeBodies: false,
+          ...(searchFilters ? { searchFilters } : {}),
+        },
       },
-      onError: (err) => {
-        toast({ variant: "destructive", description: "Export failed: " + (err.error || "Unknown error") });
+      {
+        onSuccess: (response) => {
+          queryClient.invalidateQueries({ queryKey: getGetExportLogsQueryKey() });
+          setLastExportId(response.exportId);
+
+          const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          const baseFilename = `gmail-export-${timestamp}`;
+
+          try {
+            // 1. Download full_export.json
+            downloadBlob(
+              JSON.stringify(response.fullExport, null, 2),
+              `${baseFilename}_full_export.json`,
+              "application/json"
+            );
+
+            // 2. Download ai_ingestion.jsonl
+            if (response.aiIngestion) {
+              downloadBlob(
+                typeof response.aiIngestion === "string"
+                  ? response.aiIngestion
+                  : JSON.stringify(response.aiIngestion),
+                `${baseFilename}_ai_ingestion.jsonl`,
+                "application/x-ndjson"
+              );
+            }
+
+            // 3. Download export_manifest.json
+            downloadBlob(
+              JSON.stringify(response.manifest, null, 2),
+              `${baseFilename}_export_manifest.json`,
+              "application/json"
+            );
+
+            const count = response.count ?? 0;
+            const manifest = response.manifest as ExportResult["manifest"] | null;
+            const failCount = (manifest?.attachment_failure_count ?? 0) + (manifest?.email_body_failure_count ?? 0);
+
+            toast({
+              description: failCount > 0
+                ? `Exported ${count} emails. ${failCount} extraction issue(s) — see Problems panel.`
+                : `Exported ${count} emails successfully. 3 files downloaded.`,
+            });
+
+            if (onExportComplete && manifest) {
+              onExportComplete({ manifest });
+            }
+          } catch (err) {
+            console.error("Failed to trigger download:", err);
+            toast({ variant: "destructive", description: "Export completed but download failed." });
+          }
+        },
+        onError: (err) => {
+          toast({ variant: "destructive", description: "Export failed: " + ((err as { error?: string }).error || "Unknown error") });
+        },
       }
-    });
+    );
   };
 
   if (selectedCount === 0) {
@@ -88,66 +143,50 @@ export function ExportToolbar({ selectedCount, selectedMessageIds, queryUsed, on
   }
 
   return (
-    <div className="flex flex-col sm:flex-row gap-4 items-center justify-between px-2 py-1">
+    <div className="flex items-center justify-between px-2 py-1 gap-3 flex-wrap">
       <div className="flex items-center gap-3">
         <Badge variant="secondary" className="px-2 py-1 text-sm font-medium">
           {selectedCount} selected
         </Badge>
-        <Button variant="ghost" size="sm" onClick={onClearSelection} className="text-muted-foreground hover:text-foreground h-8 px-2" data-testid="button-clear-selection">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onClearSelection}
+          className="text-muted-foreground hover:text-foreground h-8 px-2"
+          data-testid="button-clear-selection"
+        >
           <X className="h-4 w-4 mr-1" />
           Clear
         </Button>
       </div>
 
-      <div className="flex items-center gap-4">
-        <div className="hidden lg:flex items-center gap-4 text-xs bg-muted/50 p-1.5 rounded-md border border-border/50">
-          <div className="flex items-center gap-1.5 px-2">
-            <Checkbox id="opt-manifest" checked={includeManifest} onCheckedChange={(c) => setIncludeManifest(!!c)} />
-            <Label htmlFor="opt-manifest" className="font-normal cursor-pointer">Manifest</Label>
+      <div className="flex items-center gap-3">
+        {lastExportId && !exportEmails.isPending && (
+          <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            <span>3 files downloaded</span>
           </div>
-          <div className="flex items-center gap-1.5 px-2 border-l">
-            <Checkbox id="opt-chunk" checked={chunkLargeBodies} onCheckedChange={(c) => setChunkLargeBodies(!!c)} />
-            <Label htmlFor="opt-chunk" className="font-normal cursor-pointer">Chunk Large</Label>
-          </div>
-          <div className="flex items-center gap-1.5 px-2 border-l">
-            <Checkbox id="opt-split" checked={splitFiles} onCheckedChange={(c) => setSplitFiles(!!c)} />
-            <Label htmlFor="opt-split" className="font-normal cursor-pointer">Split Files</Label>
-          </div>
+        )}
+
+        <div className="hidden sm:flex items-center gap-1.5 text-xs text-muted-foreground bg-muted/50 px-3 py-1.5 rounded-md border border-border/50">
+          <FileArchive className="h-3.5 w-3.5" />
+          <span>full_export.json · ai_ingestion.jsonl · export_manifest.json</span>
         </div>
 
-        <div className="flex items-center gap-2">
-          <Select value={format} onValueChange={(v: any) => setFormat(v)}>
-            <SelectTrigger className="w-[160px] h-9" data-testid="select-export-format">
-              <div className="flex items-center gap-2">
-                <FileJson className="h-4 w-4 text-muted-foreground" />
-                <SelectValue placeholder="Format" />
-              </div>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="ai-optimized">AI-Optimized JSON</SelectItem>
-              <SelectItem value="raw">Raw JSON</SelectItem>
-              <SelectItem value="jsonl">JSONL</SelectItem>
-            </SelectContent>
-          </Select>
-
-          <Button 
-            onClick={handleExport} 
-            disabled={exportEmails.isPending}
-            className="h-9"
-            data-testid="button-execute-export"
-          >
-            {exportEmails.isPending ? (
-              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-            ) : (
-              <Download className="mr-2 h-4 w-4" />
-            )}
-            Export
-          </Button>
-        </div>
+        <Button
+          onClick={handleExport}
+          disabled={exportEmails.isPending}
+          className="h-9"
+          data-testid="button-execute-export"
+        >
+          {exportEmails.isPending ? (
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+          ) : (
+            <Download className="mr-2 h-4 w-4" />
+          )}
+          {exportEmails.isPending ? "Exporting…" : "Export Bundle"}
+        </Button>
       </div>
     </div>
   );
 }
-
-// Needed to add a simple Badge component mock if it didn't exist, but it should from shadcn
-import { Badge } from "@/components/ui/badge";
