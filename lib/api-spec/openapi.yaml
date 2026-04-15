@@ -3,13 +3,21 @@ info:
   # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Gmail Query Exporter API specification
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: auth
+    description: Authentication operations
+  - name: gmail
+    description: Gmail API operations
+  - name: export
+    description: Export operations
+  - name: savedSearches
+    description: Saved search operations
 paths:
   /healthz:
     get:
@@ -24,6 +32,231 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /auth/me:
+    get:
+      operationId: getAuthUser
+      tags: [auth]
+      summary: Get current authenticated user
+      responses:
+        "200":
+          description: User info
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthUser"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [auth]
+      summary: Log out current user
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+
+  /gmail/search:
+    post:
+      operationId: searchEmails
+      tags: [gmail]
+      summary: Search Gmail messages
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchEmailsBody"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchEmailsResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "429":
+          description: Rate limited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /gmail/messages/{messageId}:
+    get:
+      operationId: getEmailMessage
+      tags: [gmail]
+      summary: Get full email message details
+      parameters:
+        - name: messageId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Email message details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EmailMessage"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+        "404":
+          description: Message not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /gmail/labels:
+    get:
+      operationId: getLabels
+      tags: [gmail]
+      summary: Get all Gmail labels for the user
+      responses:
+        "200":
+          description: Labels list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LabelsResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /gmail/export:
+    post:
+      operationId: exportEmails
+      tags: [export]
+      summary: Export selected email messages to JSON
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExportEmailsBody"
+      responses:
+        "200":
+          description: Exported email data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportEmailsResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /saved-searches:
+    get:
+      operationId: getSavedSearches
+      tags: [savedSearches]
+      summary: Get all saved searches for current user
+      responses:
+        "200":
+          description: Saved searches
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SavedSearchesResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+    post:
+      operationId: createSavedSearch
+      tags: [savedSearches]
+      summary: Save a search query
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSavedSearchBody"
+      responses:
+        "201":
+          description: Saved search created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SavedSearch"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /saved-searches/{id}:
+    delete:
+      operationId: deleteSavedSearch
+      tags: [savedSearches]
+      summary: Delete a saved search
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
+  /export-logs:
+    get:
+      operationId: getExportLogs
+      tags: [export]
+      summary: Get audit log of exports performed
+      responses:
+        "200":
+          description: Export logs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExportLogsResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiError"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +267,379 @@ components:
       required:
         - status
 
+    ApiError:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required:
+        - error
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+      required:
+        - success
+
+    AuthUser:
+      type: object
+      properties:
+        id:
+          type: string
+        email:
+          type: string
+        name:
+          type: string
+        picture:
+          type: string
+      required:
+        - id
+        - email
+
+    SearchEmailsBody:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Gmail search query string
+        maxResults:
+          type: integer
+          default: 50
+          minimum: 1
+          maximum: 500
+        pageToken:
+          type: string
+          description: Pagination token for next page
+        includeSpamTrash:
+          type: boolean
+          default: false
+        fields:
+          $ref: "#/components/schemas/SearchFields"
+      required:
+        - query
+
+    SearchFields:
+      type: object
+      description: Structured search fields that get compiled into the query string
+      properties:
+        keywords:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        sender:
+          type: string
+        recipient:
+          type: string
+        subject:
+          type: string
+        hasWords:
+          type: string
+        doesNotHave:
+          type: string
+        label:
+          type: string
+        dateFrom:
+          type: string
+          format: date
+        dateTo:
+          type: string
+          format: date
+        allDates:
+          type: boolean
+          default: false
+        hasAttachment:
+          type: boolean
+        onlyUnread:
+          type: boolean
+        onlyStarred:
+          type: boolean
+        exactPhrase:
+          type: string
+
+    SearchEmailsResponse:
+      type: object
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/EmailSummary"
+        totalEstimate:
+          type: integer
+          description: Estimated total number of results
+        nextPageToken:
+          type: string
+          description: Token for fetching next page
+        queryUsed:
+          type: string
+          description: The actual Gmail query string used
+      required:
+        - messages
+        - queryUsed
+
+    EmailSummary:
+      type: object
+      properties:
+        id:
+          type: string
+        threadId:
+          type: string
+        subject:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        date:
+          type: string
+        snippet:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        hasAttachment:
+          type: boolean
+        sizeEstimate:
+          type: integer
+        isUnread:
+          type: boolean
+        isStarred:
+          type: boolean
+      required:
+        - id
+        - threadId
+
+    EmailMessage:
+      type: object
+      properties:
+        id:
+          type: string
+        threadId:
+          type: string
+        subject:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        cc:
+          type: string
+        bcc:
+          type: string
+        date:
+          type: string
+        internalDate:
+          type: string
+        snippet:
+          type: string
+        labels:
+          type: array
+          items:
+            type: string
+        bodyPlainText:
+          type: string
+        bodyHtmlStripped:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        attachments:
+          type: array
+          items:
+            $ref: "#/components/schemas/AttachmentMeta"
+        sizeEstimate:
+          type: integer
+        isUnread:
+          type: boolean
+        isStarred:
+          type: boolean
+      required:
+        - id
+        - threadId
+
+    AttachmentMeta:
+      type: object
+      properties:
+        filename:
+          type: string
+        mimeType:
+          type: string
+        size:
+          type: integer
+        attachmentId:
+          type: string
+      required:
+        - filename
+        - mimeType
+
+    LabelsResponse:
+      type: object
+      properties:
+        labels:
+          type: array
+          items:
+            $ref: "#/components/schemas/GmailLabel"
+      required:
+        - labels
+
+    GmailLabel:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        type:
+          type: string
+      required:
+        - id
+        - name
+
+    ExportEmailsBody:
+      type: object
+      properties:
+        messageIds:
+          type: array
+          items:
+            type: string
+          description: IDs of messages to export
+        format:
+          type: string
+          enum: [raw, ai-optimized, jsonl]
+          description: Export format
+        queryUsed:
+          type: string
+          description: The search query that produced these results
+        includeManifest:
+          type: boolean
+          default: true
+        chunkLargeBodies:
+          type: boolean
+          default: false
+        splitFiles:
+          type: boolean
+          default: false
+      required:
+        - messageIds
+        - format
+
+    ExportEmailsResponse:
+      type: object
+      properties:
+        data:
+          description: Exported data (format depends on format field)
+        manifest:
+          $ref: "#/components/schemas/ExportManifest"
+        format:
+          type: string
+        count:
+          type: integer
+        exportId:
+          type: string
+      required:
+        - data
+        - format
+        - count
+        - exportId
+
+    ExportManifest:
+      type: object
+      properties:
+        exportId:
+          type: string
+        exportTimestamp:
+          type: string
+        format:
+          type: string
+        count:
+          type: integer
+        queryUsed:
+          type: string
+        messageIds:
+          type: array
+          items:
+            type: string
+      required:
+        - exportId
+        - exportTimestamp
+        - format
+        - count
+
+    SavedSearch:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        query:
+          type: string
+        fields:
+          $ref: "#/components/schemas/SearchFields"
+        createdAt:
+          type: string
+      required:
+        - id
+        - name
+        - query
+
+    CreateSavedSearchBody:
+      type: object
+      properties:
+        name:
+          type: string
+        query:
+          type: string
+        fields:
+          $ref: "#/components/schemas/SearchFields"
+      required:
+        - name
+        - query
+
+    SavedSearchesResponse:
+      type: object
+      properties:
+        savedSearches:
+          type: array
+          items:
+            $ref: "#/components/schemas/SavedSearch"
+      required:
+        - savedSearches
+
+    ExportLog:
+      type: object
+      properties:
+        id:
+          type: integer
+        exportId:
+          type: string
+        format:
+          type: string
+        count:
+          type: integer
+        queryUsed:
+          type: string
+        createdAt:
+          type: string
+      required:
+        - id
+        - exportId
+        - format
+        - count
+
+    ExportLogsResponse:
+      type: object
+      properties:
+        logs:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExportLog"
+      required:
+        - logs

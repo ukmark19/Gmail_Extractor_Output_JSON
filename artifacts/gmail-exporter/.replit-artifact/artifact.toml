@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Gmail Query Exporter"
+version = "1.0.0"
+id = "artifacts/gmail-exporter"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 20867
+
+[services.development]
+run = "pnpm --filter @workspace/gmail-exporter run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/gmail-exporter", "run", "build" ]
+publicDir = "artifacts/gmail-exporter/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "20867"
+BASE_PATH = "/"

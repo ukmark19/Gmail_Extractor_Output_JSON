@@ -1,0 +1,321 @@
+Build a production-quality web application called “Gmail Query Exporter” that connects securely to a user’s Gmail account using the Gmail API and Google OAuth 2.0, allows advanced email searching through a polished interface, and exports matched results into clean structured JSON files suitable for upload into a custom GPT knowledge base in ChatGPT.
+
+Core goal:
+Create a robust Gmail search and export tool for power users. The user must be able to search emails using multiple criteria, preview results, select which emails to include, and export the output in well-structured JSON files designed for downstream AI ingestion.
+
+Tech stack requirements:
+- Frontend: React + TypeScript
+- Backend: Node.js + Express or Next.js API routes
+- Styling: modern, clean, professional UI using Tailwind CSS
+- Authentication: Google OAuth 2.0 with Gmail API
+- State management: sensible and lightweight
+- Validation: strong client-side and server-side validation
+- Export: downloadable JSON files
+- Environment variables for all secrets
+- Clear modular folder structure
+- README with setup instructions
+
+App name:
+Gmail Query Exporter
+
+Primary user workflow:
+1. User signs in with Google
+2. User grants Gmail read-only permissions
+3. User lands on an advanced search page
+4. User enters one or more search criteria
+5. User runs search
+6. Matching emails are displayed in a clean results grid/list with pagination
+7. User can preview an email in a side panel or modal
+8. User can select individual emails or select all results
+9. User exports selected emails to JSON
+10. JSON output is clean, structured, and optimized for use as GPT knowledge input
+
+Functional requirements
+
+1. Authentication and security
+- Implement secure Google sign-in using OAuth 2.0
+- Use least privilege scope where possible, preferably Gmail read-only
+- Store tokens securely in session or server-side only
+- Handle token refresh cleanly
+- Log out functionality required
+- Clear auth failure states and recovery paths
+
+2. Search interface
+Create a professional advanced search form with the following fields:
+
+Text fields:
+- Keywords
+- From
+- To
+- Subject
+- Has words
+- Does not have words
+- Label
+- Sender email
+- Recipient email
+
+Date filters:
+- Date from
+- Date to
+- Checkbox: All dates
+- If “All dates” is ticked, date filters are ignored
+- Support “go back forever” behaviour cleanly
+
+Other optional filters:
+- Has attachment
+- Only unread
+- Only starred
+- Include spam/trash toggle
+- Max results
+- Thread view toggle
+- Exact phrase option
+
+Important:
+Map these fields into valid Gmail search query syntax under the hood. Build a query builder service that converts UI selections into Gmail-compatible query strings safely and correctly.
+
+3. Search execution
+- Use Gmail API to execute the search
+- Return all matching emails, not just a tiny subset
+- Handle pagination robustly
+- Allow user to fetch all matches progressively
+- Show search progress or batch loading state
+- Show total result count if feasible
+- Avoid UI freezing on large result sets
+
+4. Results interface
+Build a very clean, modern interface with:
+- Search summary bar
+- Results table or card list
+- Checkbox per row
+- Select all on page
+- Select all matching results
+- Pagination controls
+- Sort options where appropriate
+- Preview panel/modal
+
+Each result should show:
+- Message ID
+- Thread ID
+- Date
+- From
+- To
+- Subject
+- Snippet
+- Labels
+- Attachment indicator
+- Size estimate if available
+
+5. Email preview
+When a user clicks a result, show:
+- Full metadata
+- Headers
+- Plain text body
+- HTML-stripped body for clean AI ingestion
+- Snippet
+- Attachment metadata
+- Internal date
+- Gmail labels
+
+6. Export system
+This is critical.
+
+The app must export selected emails to JSON in a format suitable for adding to a GPT knowledge base in ChatGPT.
+
+Create at least 3 export modes:
+
+A. Raw structured JSON
+For each email include:
+- id
+- threadId
+- subject
+- from
+- to
+- cc
+- bcc if available
+- date
+- internalDate
+- snippet
+- labels
+- bodyPlainText
+- bodyHtmlStripped
+- headers
+- attachmentMetadata
+- queryUsed
+- exportTimestamp
+
+B. AI-optimized JSON
+Flatten and clean content for knowledge ingestion:
+- document_id
+- source = "gmail"
+- subject
+- from
+- to
+- date
+- thread_id
+- labels
+- content = cleaned combined text
+- summary_stub = first 500 chars
+- metadata object
+- search_context object
+
+C. JSONL export
+One JSON object per line for future embedding/chunking workflows
+
+Also include:
+- Option to split exports into multiple files if result count is large
+- Option to chunk large email bodies into smaller logical chunks
+- Option to export a manifest.json summarising the export batch
+
+7. GPT-friendly output design
+The JSON should be specifically suitable for use in ChatGPT custom GPT knowledge workflows. Design it so the files are:
+- clean
+- consistent
+- predictable
+- easy to parse later
+- free of unnecessary Gmail noise where possible
+
+Include a preprocessing pipeline that:
+- strips excessive HTML
+- normalises whitespace
+- preserves sender/recipient/date metadata
+- removes duplicate empty fields
+- optionally merges thread context
+- optionally exports one file per email and/or one combined file
+
+8. Query builder logic
+Build a robust Gmail query builder utility:
+- convert UI fields into Gmail search syntax
+- support combinations like:
+  - from:someone@example.com
+  - to:someone@example.com
+  - subject:(invoice)
+  - after:YYYY/MM/DD
+  - before:YYYY/MM/DD
+  - has:attachment
+  - is:unread
+- handle blank fields safely
+- escape dangerous input
+- display the final generated Gmail query to the user before search
+- allow manual editing of the final query string
+
+9. Interface quality
+The UI must feel premium, clean, and efficient.
+Requirements:
+- light modern layout
+- responsive design
+- excellent spacing
+- strong typography
+- intuitive filters
+- polished buttons and inputs
+- empty states
+- loading states
+- clear error messages
+- success messages
+- accessible components
+- no clutter
+
+Suggested layout:
+- top header with app name and signed-in account
+- left filter/search panel
+- main results area
+- right preview panel or modal
+- export toolbar above results
+
+10. Robustness and edge cases
+Handle:
+- no results
+- API quota issues
+- expired tokens
+- network failures
+- malformed queries
+- very large mailboxes
+- missing headers
+- multipart email bodies
+- HTML-only emails
+- duplicate results
+- rate limiting
+- attachment metadata presence without downloading files
+- Gmail pagination tokens
+
+11. Optional advanced features
+If time permits, add:
+- saved searches
+- export presets
+- label picker from Gmail
+- date presets like last 7 days, 30 days, 12 months, all time
+- thread grouping
+- duplicate detection
+- attachment export metadata
+- dark mode
+- audit log of exports performed
+- download ZIP containing JSON files
+- chunker mode for LLM ingestion
+- de-identification option for privacy
+
+12. Privacy and permissions
+- Make it explicit in the UI that the tool only reads emails and exports selected data
+- Do not request send/delete permissions
+- Add a privacy note section
+- Make the app safe for personal business archiving and AI preparation
+
+13. Deliverables
+Produce:
+- full application code
+- clean project structure
+- .env.example
+- detailed README
+- setup guide for Google Cloud console
+- instructions for enabling Gmail API
+- instructions for setting OAuth redirect URIs
+- local development instructions
+- deployment instructions for Replit
+- comments in important code sections
+- sample exported JSON examples in a /samples folder
+
+14. Code quality
+- TypeScript types throughout
+- reusable components
+- separation between UI, Gmail API service, query builder, and export formatter
+- error boundaries where appropriate
+- defensive coding
+- no hardcoded secrets
+- maintainable naming
+- good documentation
+
+15. Testing
+Add at least basic tests for:
+- query builder
+- JSON formatter
+- date filter logic
+- all-dates checkbox behaviour
+- field validation
+
+16. UI details I specifically want
+Include these fields visibly in the search form:
+- Keywords
+- From
+- To
+- Sender
+- Recipient
+- Date From
+- Date To
+- Tick box for All Dates
+
+Notes:
+- “From” and “Sender” may overlap in practice, but keep both in the interface if useful and document how they map
+- same for “To” and “Recipient”
+- make the field labels crystal clear for end users
+
+17. Final implementation expectations
+Do not build a mockup only.
+Build a working application.
+Do not oversimplify the Gmail API integration.
+Do not leave export formatting vague.
+Make the JSON output genuinely useful for uploading into ChatGPT workflows.
+
+When finished, provide:
+1. a short explanation of architecture
+2. setup steps
+3. where to insert Google credentials
+4. how exports are structured
+5. sample Gmail queries generated from the UI
