@@ -70,6 +70,7 @@ export interface FullExportEmail {
     body_errors: string[];
   };
   attachments: AttachmentExtractionResult[];
+  attachment_text_combined: string;
   content_for_ai: {
     combined_text: string;
     chunking_strategy: "none" | "page" | "heading" | "fixed";
@@ -275,6 +276,19 @@ export function formatFullExport(
   const combinedText = buildCombinedText(email, attachments);
   const chunks = buildChunks(email, attachments);
 
+  const MAX_COMBINED_ATT_TEXT = 1_000_000;
+  let attachmentTextCombined = "";
+  for (const att of attachments) {
+    if (att.extraction_status === "success" && att.extracted_text) {
+      const block = `--- ${att.filename} (${att.mime_type}) ---\n${att.extracted_text}\n`;
+      if ((attachmentTextCombined.length + block.length) > MAX_COMBINED_ATT_TEXT) {
+        attachmentTextCombined += `--- (additional attachment text truncated; full content available in attachments[].extracted_text) ---\n`;
+        break;
+      }
+      attachmentTextCombined += block;
+    }
+  }
+
   return {
     record_type: "gmail_email",
     export_version: "1.0",
@@ -305,6 +319,7 @@ export function formatFullExport(
       body_errors: email.bodyErrors ?? [],
     },
     attachments,
+    attachment_text_combined: attachmentTextCombined,
     content_for_ai: {
       combined_text: combinedText,
       chunking_strategy: "none",
@@ -496,12 +511,75 @@ export function buildDetailedManifest(
   };
 }
 
+export interface AttachmentIndexEntry {
+  attachment_id: string;
+  parent_document_id: string;
+  parent_message_id: string;
+  parent_subject: string | null;
+  parent_from: string | null;
+  parent_date: string | null;
+  filename: string;
+  safe_filename: string;
+  content_type: string;
+  extension: string;
+  size: number;
+  sha256: string | null;
+  storage_path: string;
+  is_embedded: boolean;
+  text_extracted: boolean;
+  parse_status: ExtractionStatusLabel;
+  parse_method: string;
+  failure_category: string | null;
+  text_summary: string;
+}
+
+export type ExtractionStatusLabel = "success" | "partial" | "failed" | "unsupported" | "skipped";
+
+function summarizeText(text: string | null, maxChars = 240): string {
+  if (!text) return "";
+  const cleaned = text.replace(/\s+/g, " ").trim();
+  return cleaned.length <= maxChars ? cleaned : cleaned.slice(0, maxChars) + "…";
+}
+
+export function buildAttachmentsIndex(
+  emails: Array<{ email: EmailData; attachments: AttachmentExtractionResult[] }>
+): AttachmentIndexEntry[] {
+  const out: AttachmentIndexEntry[] = [];
+  for (const { email, attachments } of emails) {
+    for (const att of attachments) {
+      out.push({
+        attachment_id: att.attachment_id,
+        parent_document_id: att.parent_document_id,
+        parent_message_id: email.id,
+        parent_subject: email.subject ?? null,
+        parent_from: email.from ?? null,
+        parent_date: email.date ?? email.internalDate ?? null,
+        filename: att.filename,
+        safe_filename: att.safe_filename,
+        content_type: att.mime_type,
+        extension: att.file_extension,
+        size: att.size_bytes,
+        sha256: att.sha256,
+        storage_path: att.storage_path,
+        is_embedded: att.is_embedded,
+        text_extracted: att.extraction_status === "success" && !!att.extracted_text,
+        parse_status: att.extraction_status,
+        parse_method: att.extraction_method,
+        failure_category: att.failure_category,
+        text_summary: summarizeText(att.extracted_text),
+      });
+    }
+  }
+  return out;
+}
+
 export interface ExportBundle {
   exportId: string;
   exportedAt: string;
   count: number;
   fullExport: FullExportEmail[];
   aiIngestion: string;
+  attachmentsIndex: AttachmentIndexEntry[];
   manifest: DetailedManifest;
   processingLog: ProcessingLogEntry[];
 }
@@ -526,6 +604,7 @@ export function buildExportBundle(
   const aiIngestion = aiIngestionLines.join("\n");
 
   const manifest = buildDetailedManifest(exportId, emails, queryContext, exportedAt);
+  const attachmentsIndex = buildAttachmentsIndex(emails);
 
   return {
     exportId,
@@ -533,6 +612,7 @@ export function buildExportBundle(
     count: emails.length,
     fullExport,
     aiIngestion,
+    attachmentsIndex,
     manifest,
     processingLog,
   };

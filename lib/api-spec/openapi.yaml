@@ -542,6 +542,11 @@ components:
         aiIngestion:
           type: string
           description: JSONL string — one ingestion-ready object per chunk
+        attachmentsIndex:
+          type: array
+          description: Flat index of all attachments across the export, linked to parent emails
+          items:
+            type: object
         manifest:
           $ref: "#/components/schemas/ExportManifest"
         processingLog:

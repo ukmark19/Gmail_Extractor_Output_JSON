@@ -1,0 +1,421 @@
+Update the existing email-query / knowledge-ingestion system so that attachment data is fully captured, searchable, linked to parent emails, and visible in the dashboard.
+
+OBJECTIVE
+
+The current JSON only includes:
+- metadata.has_attachments
+- metadata.attachment_count
+
+This is insufficient.
+
+You must upgrade the system so that:
+1. attachment metadata is extracted and stored
+2. supported attachment files are parsed for text
+3. attachments are linked to parent emails
+4. attachment information is included in exported JSON
+5. the dashboard includes an attachment column and attachment detail visibility
+
+REQUIRED CHANGES
+
+==================================================
+1. JSON SCHEMA UPGRADE
+==================================================
+
+Extend each email record to include an attachments array.
+
+Target schema:
+
+{
+  "document_id": "",
+  "source": "gmail",
+  "subject": "",
+  "from": "",
+  "to": "",
+  "date": "",
+  "thread_id": "",
+  "labels": [],
+  "content": "",
+  "summary_stub": "",
+  "metadata": {
+    "gmail_id": "",
+    "has_attachments": false,
+    "attachment_count": 0,
+    "size_estimate": 0,
+    "internal_date": "",
+    "cc": "",
+    "bcc": ""
+  },
+  "attachments": [
+    {
+      "attachment_id": "",
+      "parent_document_id": "",
+      "filename": "",
+      "safe_filename": "",
+      "content_type": "",
+      "extension": "",
+      "size": 0,
+      "sha256": "",
+      "is_embedded": false,
+      "content_id": "",
+      "storage_path": "",
+      "downloadable": false,
+      "text_extracted": false,
+      "text_content": "",
+      "text_summary": "",
+      "parse_method": "",
+      "parse_status": "success",
+      "warnings": [],
+      "errors": []
+    }
+  ],
+  "search_context": {}
+}
+
+RULES:
+- Keep metadata.has_attachments and metadata.attachment_count
+- Add full attachments array
+- Preserve auditability to source file and parent email
+- Do not drop attachments silently
+- If extraction fails, still create attachment record with parse_status and errors
+
+==================================================
+2. ATTACHMENT EXTRACTION
+==================================================
+
+For each email source that supports attachments, extract:
+- filename
+- content type / mime type
+- extension
+- size if available
+- content-id if embedded inline
+- raw attachment bytes or saved file path
+- sha256 hash
+- embedded vs regular attachment
+
+Support at minimum:
+- .eml
+- .msg
+- Gmail export JSON structures if attachment payload is available
+- any existing internal email structures already used in the project
+
+If attachment binary content exists:
+- save attachment file to a deterministic path
+- use a safe filename
+- avoid name collisions by prefixing with parent document id or attachment id
+
+Example storage path:
+attachments/<parent_document_id>/<safe_filename>
+
+==================================================
+3. ATTACHMENT TEXT PARSING
+==================================================
+
+Parse text from supported attachment types.
+
+Support at minimum:
+- pdf
+- docx
+- txt
+- html
+- csv
+- json
+- eml
+- msg (if practical with existing parser flow)
+
+Recommended libraries:
+- pypdf for pdf
+- python-docx for docx
+- beautifulsoup4 for html
+- standard json/csv/text parsers
+- existing eml/msg parser stack for attached emails
+
+For each supported attachment:
+- extract text_content
+- set text_extracted = true if successful
+- generate a short text_summary
+- record parse_method
+- record warnings/errors
+
+If unsupported:
+- keep metadata only
+- set text_extracted = false
+- parse_status = "unsupported"
+
+If parsing fails:
+- keep metadata only
+- set parse_status = "failed"
+- record errors
+
+Do not fail the email if attachment parsing fails.
+
+==================================================
+4. PARENT-CHILD LINKAGE
+==================================================
+
+Every attachment must link back to parent email:
+
+- attachment.parent_document_id = email.document_id
+
+Optionally generate a flattened attachment index:
+
+attachments_index.json
+
+Format:
+[
+  {
+    "attachment_id": "",
+    "parent_document_id": "",
+    "parent_subject": "",
+    "parent_date": "",
+    "filename": "",
+    "content_type": "",
+    "extension": "",
+    "size": 0,
+    "sha256": "",
+    "storage_path": "",
+    "text_extracted": false,
+    "text_summary": ""
+  }
+]
+
+This is strongly recommended for search and dashboard use.
+
+==================================================
+5. SEARCH / RAG READINESS
+==================================================
+
+Attachment content must become searchable.
+
+Requirements:
+- attachment text should be included in exported data
+- keep attachment text separate from main email body
+- optionally expose a derived searchable field on the parent email:
+
+"attachment_text_combined": "..."
+
+If added:
+- concatenate extracted text from supported attachments
+- cap extremely large text if needed
+- preserve full text in attachment records even if combined field is truncated
+
+==================================================
+6. DASHBOARD UPDATE
+==================================================
+
+Update the dashboard table/list view to include an Attachment column.
+
+Attachment column requirements:
+- display Yes/No or count
+- recommended format:
+  - "No"
+  - "1 attachment"
+  - "4 attachments"
+
+Better version:
+- show count plus icon
+- clicking opens attachment panel/modal/drawer
+
+Add attachment detail UI:
+- list filenames
+- file type
+- size
+- whether text was extracted
+- parse status
+- link to parent email
+- preview extracted text summary
+
+If there is already a row-expansion or detail panel, include attachment section there.
+
+Dashboard filtering requirements:
+- filter emails with attachments only
+- filter by attachment file type if possible
+- search attachment text if full-text search exists
+
+Recommended dashboard fields:
+- Subject
+- From
+- To
+- Date
+- Labels
+- Attachments
+- Issues / summary if available
+
+==================================================
+7. EXPORT OUTPUTS
+==================================================
+
+Always produce:
+1. master_emails.json with attachments array included
+2. processing_report.json
+
+Optionally produce:
+3. attachments_index.json
+4. attachment_errors_report.json
+
+processing_report.json must now include:
+- total attachments found
+- attachments successfully saved
+- attachments successfully text-parsed
+- attachments unsupported
+- attachments failed
+- count by attachment type
+
+==================================================
+8. DEDUPLICATION
+==================================================
+
+Add attachment-aware dedupe support.
+
+For attachments:
+- use sha256
+- detect duplicates within same email
+- detect duplicates across emails if useful
+- do not delete duplicates silently
+- record duplicate relationships where identified
+
+Optional fields:
+- duplicate_of_attachment_id
+- duplicate_reason
+
+==================================================
+9. ERROR HANDLING
+==================================================
+
+Do not fail the full run because:
+- one attachment is corrupt
+- one parser fails
+- one file type is unsupported
+
+Instead:
+- create attachment record
+- mark parse_status appropriately
+- capture errors
+- continue processing
+
+==================================================
+10. IMPLEMENTATION NOTES
+==================================================
+
+Add modular helpers such as:
+- extract_attachments_from_eml(...)
+- extract_attachments_from_msg(...)
+- save_attachment_file(...)
+- parse_attachment_text(...)
+- summarize_attachment_text(...)
+- build_attachment_record(...)
+- build_attachments_index(...)
+
+Keep code modular and production-minded.
+
+Preserve backwards compatibility:
+- existing consumers using metadata.has_attachments and metadata.attachment_count must still work
+
+==================================================
+11. DASHBOARD COLUMN SPEC
+==================================================
+
+Explicitly add a new dashboard column named:
+
+Attachments
+
+Display logic:
+- if attachment_count == 0 -> "No"
+- if attachment_count == 1 -> "1 attachment"
+- if attachment_count > 1 -> "{n} attachments"
+
+Optional enhancement:
+- add paperclip icon
+- hover tooltip shows filenames
+- click opens attachment detail panel
+
+==================================================
+12. SAMPLE RECORD TARGET
+==================================================
+
+A valid upgraded email record should look like:
+
+{
+  "document_id": "gmail_19d2aabee992c849",
+  "source": "gmail",
+  "subject": "Request to Take Over Conveyancing – West Cottage, Yeavering (Urgent)",
+  "from": "Mark Richardson <mark@dmr-ltd.co.uk>",
+  "to": "d.johnston@sm-e.co.uk",
+  "date": "Thu, 26 Mar 2026 15:03:23 +0000",
+  "thread_id": "19d2a8ca450322f7",
+  "labels": ["SENT"],
+  "content": "...",
+  "summary_stub": "...",
+  "metadata": {
+    "gmail_id": "19d2aabee992c849",
+    "has_attachments": true,
+    "attachment_count": 1,
+    "size_estimate": 224190,
+    "internal_date": "1774537403000",
+    "cc": "",
+    "bcc": ""
+  },
+  "attachments": [
+    {
+      "attachment_id": "att_gmail_19d2aabee992c849_001",
+      "parent_document_id": "gmail_19d2aabee992c849",
+      "filename": "halifax-wording.pdf",
+      "safe_filename": "halifax-wording.pdf",
+      "content_type": "application/pdf",
+      "extension": ".pdf",
+      "size": 58213,
+      "sha256": "abc123...",
+      "is_embedded": false,
+      "content_id": "",
+      "storage_path": "attachments/gmail_19d2aabee992c849/halifax-wording.pdf",
+      "downloadable": true,
+      "text_extracted": true,
+      "text_content": "We have no issue with the matter proceeding if...",
+      "text_summary": "Halifax confirms matter may proceed if septic tank upgrade will comply...",
+      "parse_method": "pypdf",
+      "parse_status": "success",
+      "warnings": [],
+      "errors": []
+    }
+  ],
+  "search_context": {}
+}
+
+==================================================
+13. README / DOC UPDATE
+==================================================
+
+Update the README to explain:
+- attachment extraction support
+- supported attachment file types
+- where saved attachments are stored
+- what the Attachments dashboard column shows
+- which outputs now include attachment data
+
+==================================================
+14. TESTS
+==================================================
+
+Add tests for:
+- email with pdf attachment
+- email with docx attachment
+- email with inline embedded image
+- email with unsupported attachment type
+- corrupt attachment
+- dashboard rendering of attachment column
+- search/filter for emails with attachments
+
+==================================================
+15. DELIVERY
+==================================================
+
+Produce:
+- code changes
+- updated schema
+- updated dashboard
+- sample output JSON
+- README update
+- tests
+
+Do not leave placeholders in core functionality.
+Be explicit about assumptions.
+Keep attachment records auditable and linked to parent emails.

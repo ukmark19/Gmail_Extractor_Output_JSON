@@ -82,6 +82,7 @@ export function ResultsTable({
               <TableHead className="w-[200px]">From</TableHead>
               <TableHead className="w-[300px]">Subject</TableHead>
               <TableHead className="hidden md:table-cell">Labels</TableHead>
+              <TableHead className="w-[120px]">Attachments</TableHead>
               <TableHead className="w-[100px] text-right">Date</TableHead>
             </TableRow>
           </TableHeader>
@@ -126,6 +127,16 @@ export function ResultsTable({
                       <span className="text-[10px] text-muted-foreground">+{message.labels!.length - 3}</span>
                     )}
                   </div>
+                </TableCell>
+                <TableCell className="text-sm" data-testid={`cell-attachments-${message.id}`}>
+                  {message.hasAttachment ? (
+                    <span className="inline-flex items-center gap-1 text-foreground">
+                      <Paperclip className="h-3 w-3 text-muted-foreground" />
+                      Yes
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">No</span>
+                  )}
                 </TableCell>
                 <TableCell className="text-right text-muted-foreground text-sm whitespace-nowrap">
                   {message.date ? format(new Date(message.date), "MMM d") : ""}

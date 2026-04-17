@@ -143,6 +143,10 @@ export interface ExportEmailsBody {
 
 export type ExportEmailsResponseFullExportItem = { [key: string]: unknown };
 
+export type ExportEmailsResponseAttachmentsIndexItem = {
+  [key: string]: unknown;
+};
+
 export type ExportEmailsResponseProcessingLogItem = { [key: string]: unknown };
 
 export type ExportManifestFailureBreakdown = { [key: string]: unknown };
@@ -178,6 +182,8 @@ export interface ExportEmailsResponse {
   fullExport: ExportEmailsResponseFullExportItem[];
   /** JSONL string — one ingestion-ready object per chunk */
   aiIngestion: string;
+  /** Flat index of all attachments across the export, linked to parent emails */
+  attachmentsIndex?: ExportEmailsResponseAttachmentsIndexItem[];
   manifest: ExportManifest;
   /** Structured processing log entries */
   processingLog?: ExportEmailsResponseProcessingLogItem[];

@@ -109,14 +109,25 @@ export function ExportToolbar({
               "application/json"
             );
 
+            // 4. Download attachments_index.json (flat index linking attachments to parent emails)
+            const attachmentsIndex = (response as { attachmentsIndex?: unknown[] }).attachmentsIndex;
+            if (Array.isArray(attachmentsIndex)) {
+              downloadBlob(
+                JSON.stringify(attachmentsIndex, null, 2),
+                `${baseFilename}_attachments_index.json`,
+                "application/json"
+              );
+            }
+
             const count = response.count ?? 0;
             const manifest = response.manifest as ExportResult["manifest"] | null;
             const failCount = (manifest?.attachment_failure_count ?? 0) + (manifest?.email_body_failure_count ?? 0);
+            const fileCount = Array.isArray(attachmentsIndex) ? 4 : 3;
 
             toast({
               description: failCount > 0
                 ? `Exported ${count} emails. ${failCount} extraction issue(s) — see Problems panel.`
-                : `Exported ${count} emails successfully. 3 files downloaded.`,
+                : `Exported ${count} emails successfully. ${fileCount} files downloaded.`,
             });
 
             if (onExportComplete && manifest) {
@@ -164,7 +175,7 @@ export function ExportToolbar({
         {lastExportId && !exportEmails.isPending && (
           <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="h-3.5 w-3.5" />
-            <span>3 files downloaded</span>
+            <span>Bundle downloaded</span>
           </div>
         )}
 

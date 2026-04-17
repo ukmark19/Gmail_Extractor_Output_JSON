@@ -5,6 +5,7 @@
  * Gmail Query Exporter API specification
  * OpenAPI spec version: 0.1.0
  */
+import type { ExportEmailsResponseAttachmentsIndexItem } from "./exportEmailsResponseAttachmentsIndexItem";
 import type { ExportEmailsResponseFullExportItem } from "./exportEmailsResponseFullExportItem";
 import type { ExportEmailsResponseProcessingLogItem } from "./exportEmailsResponseProcessingLogItem";
 import type { ExportManifest } from "./exportManifest";
@@ -18,6 +19,8 @@ export interface ExportEmailsResponse {
   fullExport: ExportEmailsResponseFullExportItem[];
   /** JSONL string — one ingestion-ready object per chunk */
   aiIngestion: string;
+  /** Flat index of all attachments across the export, linked to parent emails */
+  attachmentsIndex?: ExportEmailsResponseAttachmentsIndexItem[];
   manifest: ExportManifest;
   /** Structured processing log entries */
   processingLog?: ExportEmailsResponseProcessingLogItem[];

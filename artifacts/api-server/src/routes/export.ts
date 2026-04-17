@@ -282,6 +282,7 @@ router.post(
         count: bundle.count,
         fullExport: bundle.fullExport,
         aiIngestion: bundle.aiIngestion,
+        attachmentsIndex: bundle.attachmentsIndex,
         manifest: bundle.manifest,
         processingLog: bundle.processingLog,
       });

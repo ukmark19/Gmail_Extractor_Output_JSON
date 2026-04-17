@@ -186,6 +186,12 @@ export const ExportEmailsResponse = zod.object({
   aiIngestion: zod
     .string()
     .describe("JSONL string — one ingestion-ready object per chunk"),
+  attachmentsIndex: zod
+    .array(zod.object({}).passthrough())
+    .optional()
+    .describe(
+      "Flat index of all attachments across the export, linked to parent emails",
+    ),
   manifest: zod.object({
     export_id: zod.string(),
     exported_at: zod.string(),

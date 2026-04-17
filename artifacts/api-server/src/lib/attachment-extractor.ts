@@ -1,6 +1,16 @@
 import { gmail_v1 } from "googleapis";
+import { createHash } from "crypto";
 import { logger } from "./logger";
 import { decodeBase64 } from "./gmail";
+
+function sanitizeFilename(name: string): string {
+  const cleaned = name.replace(/[\/\\:*?"<>|\x00-\x1f]/g, "_").replace(/\s+/g, "_").trim();
+  return cleaned.length > 0 ? cleaned.slice(0, 200) : "unnamed";
+}
+
+function sha256Hex(buf: Buffer): string {
+  return createHash("sha256").update(buf).digest("hex");
+}
 
 export type FailureCategory =
   | "unsupported_file_type"
@@ -31,13 +41,18 @@ export type ExtractionMethod =
 export interface AttachmentExtractionResult {
   attachment_id: string;
   message_id: string;
+  parent_document_id: string;
   part_id: string;
   filename: string;
+  safe_filename: string;
+  storage_path: string;
+  sha256: string | null;
   mime_type: string;
   file_extension: string;
   size_bytes: number;
   content_id: string;
   is_inline: boolean;
+  is_embedded: boolean;
   is_supported: boolean;
   was_downloaded: boolean;
   extraction_status: ExtractionStatus;
@@ -167,16 +182,25 @@ export async function extractAttachmentContent(
     (h) => h.name?.toLowerCase() === "content-disposition" && h.value?.includes("inline")
   );
 
+  const safeFilename = sanitizeFilename(filename);
+  const parentDocumentId = `gmail_${messageId}`;
+  const storagePath = `attachments/${parentDocumentId}/${safeFilename}`;
+
   const base: Omit<AttachmentExtractionResult, "extraction_status" | "failure_category" | "failure_detail" | "user_action_needed" | "extraction_method" | "text_quality" | "contains_structured_data" | "structured_data_type" | "page_count" | "sheet_names" | "extracted_text" | "structured_data" | "is_supported" | "was_downloaded" | "skip_reason"> = {
     attachment_id: attachmentId,
     message_id: messageId,
+    parent_document_id: parentDocumentId,
     part_id: partId,
     filename,
+    safe_filename: safeFilename,
+    storage_path: storagePath,
+    sha256: null,
     mime_type: mimeType,
     file_extension: fileExtension,
     size_bytes: sizeBytes,
     content_id: contentId,
     is_inline: isInline,
+    is_embedded: isInline && !!contentId,
     warnings: [],
     errors: [],
   };
@@ -302,6 +326,7 @@ export async function extractAttachmentContent(
     }
     const base64 = rawData.replace(/-/g, "+").replace(/_/g, "/");
     attachmentData = Buffer.from(base64, "base64");
+    base.sha256 = sha256Hex(attachmentData);
     processingLog.push(makeLogEntry(messageId, attachmentId, filename, "attachment_download_completed", "success", startTime));
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);

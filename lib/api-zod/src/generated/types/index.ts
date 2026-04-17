@@ -16,6 +16,7 @@ export * from "./emailSummary";
 export * from "./exportEmailsBody";
 export * from "./exportEmailsBodySearchFilters";
 export * from "./exportEmailsResponse";
+export * from "./exportEmailsResponseAttachmentsIndexItem";
 export * from "./exportEmailsResponseFullExportItem";
 export * from "./exportEmailsResponseProcessingLogItem";
 export * from "./exportLog";
