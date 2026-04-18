@@ -1,0 +1,74 @@
+The attachment pipeline is now working correctly for detection, download, indexing, and export.
+
+The remaining problem is PDF extraction.
+
+Evidence from the latest export:
+- attachments array is present
+- attachmentsIndex is present
+- processingLog is present
+- all 4 PDF attachments were detected and downloaded successfully
+- extraction failed afterward
+
+Current errors:
+1. "pdfParse is not a function"
+2. "DOMMatrix is not defined"
+
+This means the current blocker is NOT attachment handling.
+It is the PDF parser implementation/runtime.
+
+TASK
+Fix only PDF attachment text extraction in this pass.
+
+REQUIREMENTS
+
+1. Diagnose the current PDF parser import/runtime issue
+- identify exactly where pdfParse is imported
+- identify why it is not callable
+- fix ESM/CommonJS interop if needed
+
+2. Diagnose the DOMMatrix failure
+- identify which library/path requires DOMMatrix
+- remove that dependency path for server-side PDF extraction OR polyfill correctly if absolutely necessary
+- prefer a Node-safe PDF extraction approach
+
+3. Replace unstable PDF parsing with a reliable server-side solution
+Use a Node-safe parser suitable for backend extraction.
+Prefer a stable approach that works in Replit/server runtime.
+
+4. Keep the existing attachment pipeline unchanged
+Do NOT rewrite:
+- attachment detection
+- attachment download
+- attachments array structure
+- attachmentsIndex
+- processingLog
+unless necessary for the parser fix
+
+5. Success criteria
+For PDF attachments:
+- extraction_status should become "success" when parsing works
+- extracted_text should be populated
+- text_extracted should be true in the flattened attachment index
+- attachment_text_combined should include extracted attachment text
+- manifest counts should reflect extracted_success_count > 0
+
+6. Logging
+Add one clear log line showing:
+- parser selected
+- parser succeeded/failed
+- pages extracted if available
+
+7. If one PDF fails, continue processing others
+Do not fail the entire export
+
+8. Return
+After implementing, report:
+- root cause of pdfParse failure
+- root cause of DOMMatrix failure
+- exact files changed
+- parser/library now used
+- one sample attachment object showing extracted_text populated
+
+IMPORTANT
+This is a PDF extraction fix only.
+Do not spend this pass on UI or schema changes.

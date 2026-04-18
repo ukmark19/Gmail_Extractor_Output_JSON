@@ -485,12 +485,31 @@ export async function extractAttachmentContent(
 
     // PDF
     if (mimeType === "application/pdf") {
-      const pdfParseModule = await import("pdf-parse");
-      const pdfParse = pdfParseModule.default ?? pdfParseModule;
+      // Import directly from lib/ to avoid pdf-parse v1's index.js debug-mode
+      // side effect that tries to read a hard-coded test file at startup.
+      const pdfParseModule: unknown = await import("pdf-parse/lib/pdf-parse.js");
+      const pdfParseRaw =
+        (pdfParseModule as { default?: unknown }).default ?? pdfParseModule;
+      const pdfParse = pdfParseRaw as (
+        data: Buffer,
+        opts?: Record<string, unknown>,
+      ) => Promise<{ text: string; numpages: number }>;
       let pdfData: { text: string; numpages: number };
       try {
+        if (typeof pdfParse !== "function") {
+          throw new Error(
+            `pdf-parse export is not callable (got ${typeof pdfParse}). Check pdf-parse version — expected v1.x.`,
+          );
+        }
         pdfData = await pdfParse(attachmentData);
+        console.log(
+          `[pdf-extract] parser=pdf-parse@1 status=success pages=${pdfData.numpages} chars=${pdfData.text.length} file="${filename}"`,
+        );
       } catch (pdfErr) {
+        const errMsgRaw = pdfErr instanceof Error ? pdfErr.message : String(pdfErr);
+        console.log(
+          `[pdf-extract] parser=pdf-parse@1 status=failed file="${filename}" error="${errMsgRaw}"`,
+        );
         const errMsg = pdfErr instanceof Error ? pdfErr.message : String(pdfErr);
         const isEncrypted =
           errMsg.toLowerCase().includes("encrypt") ||
