@@ -1,5 +1,5 @@
 import { useGetEmailMessage } from "@workspace/api-client-react";
-import { X, Paperclip, Loader2 } from "lucide-react";
+import { X, Paperclip, Loader2, CheckCircle2, AlertTriangle, FileQuestion, FileText } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -7,6 +7,55 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { format } from "date-fns";
+
+type AttachmentLike = {
+  filename?: string;
+  mimeType?: string;
+  size?: number;
+  attachmentId?: string;
+  extractionStatus?: "success" | "failed" | "unsupported" | "pending" | string;
+  extractionMethod?: string | null;
+  extractedText?: string | null;
+  failureCategory?: string | null;
+  errorMessage?: string | null;
+};
+
+function formatBytes(n?: number) {
+  if (!n || n <= 0) return "Unknown size";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function statusBanner(att: AttachmentLike) {
+  const s = att.extractionStatus;
+  if (s === "success") {
+    return {
+      icon: <CheckCircle2 className="h-3.5 w-3.5" />,
+      label: "Extracted successfully",
+      className: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20",
+    };
+  }
+  if (s === "failed") {
+    return {
+      icon: <AlertTriangle className="h-3.5 w-3.5" />,
+      label: "Attachment detected, extraction failed",
+      className: "bg-destructive/10 text-destructive border-destructive/20",
+    };
+  }
+  if (s === "unsupported") {
+    return {
+      icon: <FileQuestion className="h-3.5 w-3.5" />,
+      label: "Attachment detected, unsupported type",
+      className: "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20",
+    };
+  }
+  return {
+    icon: <Paperclip className="h-3.5 w-3.5" />,
+    label: "Attachment detected — extraction runs at export time",
+    className: "bg-muted text-muted-foreground border-border",
+  };
+}
 
 interface EmailPreviewProps {
   messageId: string;
@@ -124,23 +173,96 @@ export function EmailPreview({ messageId, onClose, isSelected, onToggleSelect }:
 
               <TabsContent value="attachments" className="h-full m-0">
                 <ScrollArea className="h-full">
-                  <div className="p-4 space-y-2">
+                  <div className="p-4 space-y-3" data-testid="attachments-section">
                     {message.attachments && message.attachments.length > 0 ? (
-                      message.attachments.map((att, i) => (
-                        <div key={i} className="flex items-center gap-3 p-3 border rounded-md bg-card">
-                          <div className="bg-muted p-2 rounded">
-                            <Paperclip className="h-4 w-4" />
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <p className="text-sm font-medium truncate">{att.filename || 'Unnamed attachment'}</p>
-                            <p className="text-xs text-muted-foreground">{att.mimeType} • {att.size ? Math.round(att.size / 1024) + ' KB' : 'Unknown size'}</p>
-                          </div>
+                      <>
+                        <div className="text-xs text-muted-foreground pb-1">
+                          {message.attachments.length} attachment{message.attachments.length === 1 ? "" : "s"} on this email.
+                          Extraction status reflects the most recent export run.
                         </div>
-                      ))
+                        {(message.attachments as AttachmentLike[]).map((att, i) => {
+                          const banner = statusBanner(att);
+                          const hasText = !!(att.extractedText && att.extractedText.trim().length > 0);
+                          const preview = hasText ? att.extractedText!.trim().slice(0, 600) : "";
+                          const truncated = hasText && att.extractedText!.length > 600;
+                          return (
+                            <div
+                              key={i}
+                              className="border rounded-md bg-card overflow-hidden"
+                              data-testid={`attachment-item-${i}`}
+                            >
+                              <div className="flex items-start gap-3 p-3 border-b">
+                                <div className="bg-muted p-2 rounded shrink-0">
+                                  <Paperclip className="h-4 w-4" />
+                                </div>
+                                <div className="flex-1 min-w-0 space-y-1">
+                                  <p className="text-sm font-medium break-all" data-testid={`attachment-filename-${i}`}>
+                                    {att.filename || "Unnamed attachment"}
+                                  </p>
+                                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                                    <span data-testid={`attachment-mime-${i}`}>
+                                      <span className="font-medium text-foreground/70">Type:</span> {att.mimeType || "unknown"}
+                                    </span>
+                                    <span data-testid={`attachment-size-${i}`}>
+                                      <span className="font-medium text-foreground/70">Size:</span> {formatBytes(att.size)}
+                                    </span>
+                                    {att.extractionMethod && (
+                                      <span data-testid={`attachment-method-${i}`}>
+                                        <span className="font-medium text-foreground/70">Method:</span> {att.extractionMethod}
+                                      </span>
+                                    )}
+                                    <span data-testid={`attachment-text-flag-${i}`}>
+                                      <span className="font-medium text-foreground/70">Text extracted:</span>{" "}
+                                      {hasText ? "Yes" : "No"}
+                                    </span>
+                                  </div>
+                                </div>
+                                <Badge
+                                  variant="outline"
+                                  className={`text-[10px] flex items-center gap-1 shrink-0 ${banner.className}`}
+                                  data-testid={`attachment-status-${i}`}
+                                >
+                                  {banner.icon}
+                                  {banner.label}
+                                </Badge>
+                              </div>
+
+                              {att.extractionStatus === "failed" && att.errorMessage && (
+                                <div className="px-3 py-2 text-xs bg-destructive/5 text-destructive border-b">
+                                  <span className="font-medium">Error:</span> {att.errorMessage}
+                                  {att.failureCategory && (
+                                    <span className="ml-2 opacity-75">({att.failureCategory})</span>
+                                  )}
+                                </div>
+                              )}
+
+                              {hasText && (
+                                <div className="p-3 space-y-1">
+                                  <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                                    <FileText className="h-3 w-3" />
+                                    Extracted text preview
+                                  </div>
+                                  <div
+                                    className="text-xs font-mono whitespace-pre-wrap leading-relaxed bg-muted/40 rounded p-2 max-h-48 overflow-auto"
+                                    data-testid={`attachment-preview-${i}`}
+                                  >
+                                    {preview}
+                                    {truncated && (
+                                      <span className="block mt-2 text-muted-foreground italic">
+                                        … truncated. Full text appears in the export bundle.
+                                      </span>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </>
                     ) : (
-                      <div className="text-center p-8 text-muted-foreground">
+                      <div className="text-center p-8 text-muted-foreground" data-testid="attachments-empty">
                         <Paperclip className="h-8 w-8 mx-auto mb-2 opacity-20" />
-                        <p>No attachments found.</p>
+                        <p>No attachments</p>
                       </div>
                     )}
                   </div>
