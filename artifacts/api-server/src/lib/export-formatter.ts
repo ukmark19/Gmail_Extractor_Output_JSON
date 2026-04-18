@@ -41,27 +41,31 @@ export interface EmailData {
 }
 
 export interface FullExportEmail {
+  document_id: string;
+  source: "gmail";
   record_type: "gmail_email";
-  export_version: "1.0";
+  export_version: "1.1";
   exported_at: string;
-  query_context: QueryContext;
-  email: {
-    id: string;
-    thread_id: string;
-    subject: string | null;
-    from: string | null;
-    to: string[];
-    cc: string[];
-    bcc: string[];
-    reply_to: string | null;
-    date_header: string | null;
-    internal_date: string | null;
-    snippet: string | null;
-    labels: string[];
+  subject: string | null;
+  from: string | null;
+  to: string;
+  date: string | null;
+  thread_id: string;
+  labels: string[];
+  content: string;
+  summary_stub: string;
+  metadata: {
+    gmail_id: string;
     has_attachments: boolean;
     attachment_count: number;
-    message_size_estimate: number;
+    size_estimate: number;
+    internal_date: string | null;
+    cc: string;
+    bcc: string;
   };
+  attachments: AttachmentExtractionResult[];
+  attachment_text_combined: string;
+  search_context: QueryContext;
   body: {
     plain_text: string | null;
     html_stripped_text: string | null;
@@ -69,8 +73,6 @@ export interface FullExportEmail {
     body_extraction_status: "success" | "partial" | "failed";
     body_errors: string[];
   };
-  attachments: AttachmentExtractionResult[];
-  attachment_text_combined: string;
   content_for_ai: {
     combined_text: string;
     chunking_strategy: "none" | "page" | "heading" | "fixed";
@@ -289,28 +291,35 @@ export function formatFullExport(
     }
   }
 
+  const contentBody = email.bodyPlainText || email.bodyHtmlStripped || email.snippet || "";
+  const summaryStub = contentBody.replace(/\s+/g, " ").trim().slice(0, 280);
+
   return {
+    document_id: `gmail_${email.id}`,
+    source: "gmail",
     record_type: "gmail_email",
-    export_version: "1.0",
+    export_version: "1.1",
     exported_at: exportedAt,
-    query_context: queryContext,
-    email: {
-      id: email.id,
-      thread_id: email.threadId,
-      subject: email.subject ?? null,
-      from: email.from ?? null,
-      to: toList,
-      cc: ccList,
-      bcc: bccList,
-      reply_to: email.replyTo ?? null,
-      date_header: email.date ?? null,
-      internal_date: email.internalDate ?? null,
-      snippet: email.snippet ?? null,
-      labels: email.labels ?? [],
+    subject: email.subject ?? null,
+    from: email.from ?? null,
+    to: toList.join(", "),
+    date: email.date ?? null,
+    thread_id: email.threadId,
+    labels: email.labels ?? [],
+    content: contentBody,
+    summary_stub: summaryStub,
+    metadata: {
+      gmail_id: email.id,
       has_attachments: attachments.length > 0,
       attachment_count: attachments.length,
-      message_size_estimate: email.sizeEstimate ?? 0,
+      size_estimate: email.sizeEstimate ?? 0,
+      internal_date: email.internalDate ?? null,
+      cc: ccList.join(", "),
+      bcc: bccList.join(", "),
     },
+    attachments,
+    attachment_text_combined: attachmentTextCombined,
+    search_context: queryContext,
     body: {
       plain_text: email.bodyPlainText ?? null,
       html_stripped_text: email.bodyHtmlStripped ?? null,
@@ -318,8 +327,6 @@ export function formatFullExport(
       body_extraction_status: email.bodyExtractionStatus ?? "success",
       body_errors: email.bodyErrors ?? [],
     },
-    attachments,
-    attachment_text_combined: attachmentTextCombined,
     content_for_ai: {
       combined_text: combinedText,
       chunking_strategy: "none",

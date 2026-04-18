@@ -78,6 +78,14 @@ router.post(
       const processingLog: ProcessingLogEntry[] = [];
       const emailBundles: Array<{ email: EmailData; attachments: AttachmentExtractionResult[] }> = [];
 
+      let totalAttachmentsDetected = 0;
+      let totalAttachmentsExtracted = 0;
+      let totalAttachmentsFailed = 0;
+      let totalAttachmentsUnsupported = 0;
+      let totalEmailsWithLabel = 0;
+
+      req.log.info({ message_count: messageIds.length }, "[export] starting bundle export");
+
       for (const messageId of messageIds) {
         const fetchStart = Date.now();
         processingLog.push({
@@ -187,6 +195,26 @@ router.post(
 
           // Extract attachment metadata from parts recursively
           const rawAttachmentParts = collectAttachmentParts(parts);
+          const hasAttachmentLabel = labelIds.includes("HAS_ATTACHMENT");
+          if (hasAttachmentLabel) totalEmailsWithLabel++;
+          totalAttachmentsDetected += rawAttachmentParts.length;
+
+          req.log.info(
+            {
+              message_id: messageId,
+              has_attachment_label: hasAttachmentLabel,
+              parts_with_filename: rawAttachmentParts.length,
+              filenames: rawAttachmentParts.map((p) => p.filename).filter(Boolean),
+            },
+            `[export] email ${messageId}: detected ${rawAttachmentParts.length} attachment part(s)`,
+          );
+
+          if (hasAttachmentLabel && rawAttachmentParts.length === 0) {
+            req.log.warn(
+              { message_id: messageId },
+              `[export] email ${messageId}: HAS_ATTACHMENT label set but no attachment parts found in payload`,
+            );
+          }
 
           processingLog.push(...rawAttachmentParts.map((p) => ({
             timestamp: new Date().toISOString(),
@@ -207,6 +235,22 @@ router.post(
           for (const part of rawAttachmentParts) {
             const result = await extractAttachmentContent(gmail, messageId, part, processingLog);
             attachments.push(result);
+            req.log.info(
+              {
+                message_id: messageId,
+                attachment_id: result.attachment_id,
+                filename: result.filename,
+                mime_type: result.mime_type,
+                size_bytes: result.size_bytes,
+                status: result.extraction_status,
+                method: result.extraction_method,
+                failure_category: result.failure_category,
+              },
+              `[export] attachment "${result.filename}" -> status=${result.extraction_status}${result.failure_category ? ` (${result.failure_category})` : ""}`,
+            );
+            if (result.extraction_status === "success") totalAttachmentsExtracted++;
+            else if (result.extraction_status === "failed") totalAttachmentsFailed++;
+            else if (result.extraction_status === "unsupported") totalAttachmentsUnsupported++;
           }
 
           processingLog.push({
@@ -251,6 +295,19 @@ router.post(
       };
 
       const bundle = buildExportBundle(emailBundles, queryContext, processingLog);
+
+      req.log.info(
+        {
+          export_id: bundle.exportId,
+          emails_processed: emailBundles.length,
+          emails_with_has_attachment_label: totalEmailsWithLabel,
+          attachments_detected: totalAttachmentsDetected,
+          attachments_extracted_success: totalAttachmentsExtracted,
+          attachments_failed: totalAttachmentsFailed,
+          attachments_unsupported: totalAttachmentsUnsupported,
+        },
+        `[export] complete: ${emailBundles.length} emails, ${totalAttachmentsDetected} attachments detected, ${totalAttachmentsExtracted} extracted, ${totalAttachmentsFailed} failed, ${totalAttachmentsUnsupported} unsupported`,
+      );
 
       processingLog.push({
         timestamp: new Date().toISOString(),

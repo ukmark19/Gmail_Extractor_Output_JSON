@@ -1,0 +1,86 @@
+The attachment implementation has NOT worked.
+
+Current state:
+- There is NO "attachments" column in the dashboard
+- There is NO "attachments" array in the JSON output
+- Only metadata.has_attachments and metadata.attachment_count exist
+- I cannot find any logs to confirm whether:
+  (a) attachments were not processed, or
+  (b) processing failed
+
+This means the attachment feature is effectively NOT implemented.
+
+REQUIRED ACTION
+
+1. DIAGNOSE FIRST (do not implement blindly)
+- Confirm whether attachment extraction code is being executed
+- Identify where in the pipeline attachments should be processed
+- Confirm whether attachment data is being dropped, skipped, or failing
+- Output a clear explanation of:
+  - where attachments SHOULD be created
+  - why they are NOT appearing in the final JSON
+
+2. ADD LOGGING (MANDATORY)
+Add structured logging at these points:
+- when an email with attachments is detected
+- when attachment extraction starts
+- when each attachment is processed
+- when attachment parsing succeeds/fails
+- when attachments are written to JSON
+
+Create:
+logs/attachment_processing.log
+
+Each log entry must include:
+- document_id
+- filename (if available)
+- status (detected / extracted / parsed / failed / skipped)
+- error message if any
+
+3. VALIDATION OUTPUT
+After processing, output:
+- total emails with attachments (based on metadata)
+- total attachments actually extracted
+- total attachments written to JSON
+- total failures
+
+4. HARD REQUIREMENT (DO NOT SKIP)
+Ensure final JSON includes:
+
+"attachments": []
+
+If attachments exist, this must be populated.
+
+5. DASHBOARD REQUIREMENT
+Ensure dashboard includes:
+- column: "Attachments"
+- display:
+  - "No"
+  - "1 attachment"
+  - "N attachments"
+
+If dashboard code is separate:
+- identify where table columns are defined
+- confirm whether attachment column is missing or not wired to data
+
+6. FAIL FAST
+If attachments cannot be processed:
+- do NOT silently continue
+- return explicit error summary
+
+OUTPUT REQUIRED
+
+Respond with:
+1. Root cause of why attachments are missing
+2. Files/modules responsible
+3. What was not executed or failed
+4. Exact fix applied
+5. Sample JSON showing attachments array populated
+6. Confirmation dashboard column is implemented
+
+Do NOT say "implemented" unless:
+- attachments array exists in JSON
+- at least one attachment is present in output
+- dashboard column is visible
+
+This is a debugging task, not a fresh implementation.

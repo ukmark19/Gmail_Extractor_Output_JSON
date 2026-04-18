@@ -68,7 +68,7 @@ export function ResultsTable({
   return (
     <div className="h-full flex flex-col">
       <div className="flex-1 overflow-auto">
-        <Table>
+        <Table className="min-w-[640px]">
           <TableHeader className="sticky top-0 bg-background z-10 shadow-sm">
             <TableRow>
               <TableHead className="w-[36px] pl-3">
