@@ -119,10 +119,22 @@ export function ExportToolbar({
               );
             }
 
+            // 5. Download processing_log.json — full per-attachment audit trail (download/extract/errors)
+            const processingLog = (response as { processingLog?: unknown[] }).processingLog;
+            if (Array.isArray(processingLog) && processingLog.length > 0) {
+              downloadBlob(
+                JSON.stringify(processingLog, null, 2),
+                `${baseFilename}_processing_log.json`,
+                "application/json"
+              );
+            }
+
             const count = response.count ?? 0;
             const manifest = response.manifest as ExportResult["manifest"] | null;
             const failCount = (manifest?.attachment_failure_count ?? 0) + (manifest?.email_body_failure_count ?? 0);
-            const fileCount = Array.isArray(attachmentsIndex) ? 4 : 3;
+            let fileCount = 3;
+            if (Array.isArray(attachmentsIndex)) fileCount++;
+            if (Array.isArray(processingLog) && processingLog.length > 0) fileCount++;
 
             toast({
               description: failCount > 0

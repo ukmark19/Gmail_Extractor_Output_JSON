@@ -71,19 +71,18 @@ export function ResultsTable({
         <Table>
           <TableHeader className="sticky top-0 bg-background z-10 shadow-sm">
             <TableRow>
-              <TableHead className="w-[40px] pl-4">
+              <TableHead className="w-[36px] pl-3">
                 <Checkbox 
                   checked={allPageSelected ? true : somePageSelected ? "indeterminate" : false}
                   onCheckedChange={(c) => onSelectAllOnPage(!!c)}
                   data-testid="checkbox-select-all"
                 />
               </TableHead>
-              <TableHead className="w-[40px]"></TableHead>
-              <TableHead className="w-[200px]">From</TableHead>
-              <TableHead className="w-[300px]">Subject</TableHead>
-              <TableHead className="hidden md:table-cell">Labels</TableHead>
+              <TableHead className="w-[160px]">From</TableHead>
+              <TableHead>Subject</TableHead>
+              <TableHead className="hidden lg:table-cell">Labels</TableHead>
               <TableHead className="w-[120px]">Attachments</TableHead>
-              <TableHead className="w-[100px] text-right">Date</TableHead>
+              <TableHead className="w-[80px] text-right pr-3">Date</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -94,29 +93,26 @@ export function ResultsTable({
                 onClick={() => onRowClick(message.id)}
                 data-testid={`row-email-${message.id}`}
               >
-                <TableCell className="pl-4" onClick={e => e.stopPropagation()}>
+                <TableCell className="pl-3" onClick={e => e.stopPropagation()}>
                   <Checkbox 
                     checked={selectedIds.has(message.id)}
                     onCheckedChange={(c) => onSelectionChange(message.id, !!c)}
                     data-testid={`checkbox-select-${message.id}`}
                   />
                 </TableCell>
-                <TableCell>
-                  <div className="flex flex-col gap-1 items-center justify-center text-muted-foreground">
-                    {message.isStarred && <Star className="h-3 w-3 fill-yellow-400 text-yellow-400" />}
-                    {message.hasAttachment && <Paperclip className="h-3 w-3" />}
+                <TableCell className={`font-medium truncate max-w-[160px] ${message.isUnread ? 'text-foreground' : 'text-muted-foreground'}`}>
+                  <div className="flex items-center gap-1">
+                    {message.isStarred && <Star className="h-3 w-3 fill-yellow-400 text-yellow-400 shrink-0" />}
+                    <span className="truncate" title={message.from}>{message.from?.split('<')[0]?.trim() || message.from}</span>
                   </div>
                 </TableCell>
-                <TableCell className={`font-medium truncate max-w-[200px] ${message.isUnread ? 'text-foreground' : 'text-muted-foreground'}`}>
-                  <span title={message.from}>{message.from?.split('<')[0]?.trim() || message.from}</span>
-                </TableCell>
-                <TableCell className="truncate max-w-[300px]">
+                <TableCell className="truncate max-w-0">
                   <span className={message.isUnread ? 'font-bold text-foreground' : 'text-foreground'}>
                     {message.subject || '(no subject)'}
                   </span>
                   <span className="text-muted-foreground text-sm ml-2">- {message.snippet}</span>
                 </TableCell>
-                <TableCell className="hidden md:table-cell">
+                <TableCell className="hidden lg:table-cell">
                   <div className="flex flex-wrap gap-1">
                     {message.labels?.filter(l => !['UNREAD', 'STARRED'].includes(l)).slice(0, 3).map(label => (
                       <Badge key={label} variant="outline" className="text-[10px] px-1 py-0 h-4">
