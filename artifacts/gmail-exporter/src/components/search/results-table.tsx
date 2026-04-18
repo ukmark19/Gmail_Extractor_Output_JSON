@@ -67,8 +67,8 @@ export function ResultsTable({
 
   return (
     <div className="h-full flex flex-col">
-      <div className="flex-1 overflow-auto">
-        <Table className="min-w-[640px]">
+      <div className="flex-1 overflow-x-auto overflow-y-auto">
+        <Table className="min-w-[820px] w-full table-fixed">
           <TableHeader className="sticky top-0 bg-background z-10 shadow-sm">
             <TableRow>
               <TableHead className="w-[36px] pl-3">
@@ -80,8 +80,8 @@ export function ResultsTable({
               </TableHead>
               <TableHead className="w-[160px]">From</TableHead>
               <TableHead>Subject</TableHead>
-              <TableHead className="hidden lg:table-cell">Labels</TableHead>
-              <TableHead className="w-[120px]">Attachments</TableHead>
+              <TableHead className="hidden lg:table-cell w-[180px]">Labels</TableHead>
+              <TableHead className="w-[140px]">Attachments</TableHead>
               <TableHead className="w-[80px] text-right pr-3">Date</TableHead>
             </TableRow>
           </TableHeader>
@@ -125,14 +125,26 @@ export function ResultsTable({
                   </div>
                 </TableCell>
                 <TableCell className="text-sm" data-testid={`cell-attachments-${message.id}`}>
-                  {message.hasAttachment ? (
-                    <span className="inline-flex items-center gap-1 text-foreground">
-                      <Paperclip className="h-3 w-3 text-muted-foreground" />
-                      Yes
-                    </span>
-                  ) : (
-                    <span className="text-muted-foreground">No</span>
-                  )}
+                  {(() => {
+                    const count = (message as { attachmentCount?: number }).attachmentCount;
+                    if (typeof count === "number" && count > 0) {
+                      return (
+                        <span className="inline-flex items-center gap-1 text-foreground whitespace-nowrap">
+                          <Paperclip className="h-3 w-3 text-muted-foreground shrink-0" />
+                          {count === 1 ? "1 attachment" : `${count} attachments`}
+                        </span>
+                      );
+                    }
+                    if (message.hasAttachment) {
+                      return (
+                        <span className="inline-flex items-center gap-1 text-foreground whitespace-nowrap">
+                          <Paperclip className="h-3 w-3 text-muted-foreground shrink-0" />
+                          Has attachments
+                        </span>
+                      );
+                    }
+                    return <span className="text-muted-foreground">No</span>;
+                  })()}
                 </TableCell>
                 <TableCell className="text-right text-muted-foreground text-sm whitespace-nowrap">
                   {message.date ? format(new Date(message.date), "MMM d") : ""}
