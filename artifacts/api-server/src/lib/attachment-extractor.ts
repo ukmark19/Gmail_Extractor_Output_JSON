@@ -1,7 +1,166 @@
 import { gmail_v1 } from "googleapis";
 import { createHash } from "crypto";
+import { spawn } from "child_process";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 import { logger } from "./logger";
 import { decodeBase64 } from "./gmail";
+
+const OCR_MAX_PAGES = 20;
+const OCR_TRIGGER_CHAR_THRESHOLD = 50;
+
+async function runCommand(
+  cmd: string,
+  args: string[],
+  opts: { input?: Buffer; timeoutMs?: number } = {},
+): Promise<{ stdout: Buffer; stderr: string; code: number }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args);
+    const stdoutChunks: Buffer[] = [];
+    let stderr = "";
+    const timer = opts.timeoutMs
+      ? setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error(`${cmd} timed out after ${opts.timeoutMs}ms`));
+        }, opts.timeoutMs)
+      : null;
+    child.stdout.on("data", (c: Buffer) => stdoutChunks.push(c));
+    child.stderr.on("data", (c: Buffer) => {
+      stderr += c.toString("utf8");
+    });
+    child.on("error", (err) => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ stdout: Buffer.concat(stdoutChunks), stderr, code: code ?? -1 });
+    });
+    if (opts.input) {
+      child.stdin.end(opts.input);
+    } else {
+      child.stdin.end();
+    }
+  });
+}
+
+async function getPdfPageCount(buffer: Buffer): Promise<number | null> {
+  // Primary: pdfinfo from poppler — read PDF from stdin
+  try {
+    const { stdout, code } = await runCommand("pdfinfo", ["-"], {
+      input: buffer,
+      timeoutMs: 15_000,
+    });
+    if (code === 0) {
+      const match = stdout.toString("utf8").match(/^Pages:\s+(\d+)/m);
+      if (match) return parseInt(match[1], 10);
+    }
+  } catch {
+    /* fall through to byte-scan */
+  }
+  // Fallback: scan PDF bytes for /Type /Page object declarations.
+  try {
+    const text = buffer.toString("latin1");
+    const matches = text.match(/\/Type\s*\/Page[^s]/g);
+    if (matches && matches.length > 0) return matches.length;
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+async function ocrPdf(
+  buffer: Buffer,
+  meta: { messageId: string; attachmentId: string; filename: string },
+): Promise<{ text: string; pagesProcessed: number; pagesTotal: number | null }> {
+  const tmpDir = await mkdtemp(join(tmpdir(), "pdf-ocr-"));
+  try {
+    const pdfPath = join(tmpDir, "input.pdf");
+    await writeFile(pdfPath, buffer);
+    const pageCount = await getPdfPageCount(buffer);
+    const pagesToProcess = pageCount
+      ? Math.min(pageCount, OCR_MAX_PAGES)
+      : OCR_MAX_PAGES;
+    console.log("[pdf.ocr.rasterize.started]", {
+      ...meta,
+      pagesToProcess,
+      pagesTotal: pageCount,
+    });
+    // pdftoppm -r 200 -f 1 -l N -png input.pdf prefix → prefix-1.png, prefix-2.png, ...
+    const { code, stderr } = await runCommand(
+      "pdftoppm",
+      [
+        "-r",
+        "200",
+        "-f",
+        "1",
+        "-l",
+        String(pagesToProcess),
+        "-png",
+        pdfPath,
+        join(tmpDir, "page"),
+      ],
+      { timeoutMs: 120_000 },
+    );
+    if (code !== 0) {
+      throw new Error(`pdftoppm exited ${code}: ${stderr.slice(0, 500)}`);
+    }
+    const files = (await readdir(tmpDir))
+      .filter((f) => f.startsWith("page-") && f.endsWith(".png"))
+      .sort();
+    console.log("[pdf.ocr.rasterize.completed]", {
+      ...meta,
+      pagesRendered: files.length,
+    });
+
+    const tesseractMod = await import("tesseract.js");
+    const recognize = (
+      tesseractMod as unknown as {
+        recognize: (
+          img: Buffer,
+          lang: string,
+          options?: Record<string, unknown>,
+        ) => Promise<{ data: { text: string } }>;
+      }
+    ).recognize;
+
+    let combined = "";
+    for (let i = 0; i < files.length; i++) {
+      const pngPath = join(tmpDir, files[i]);
+      const pngBuf = await readFile(pngPath);
+      console.log("[pdf.ocr.page.started]", {
+        ...meta,
+        page: i + 1,
+        of: files.length,
+      });
+      try {
+        const result = await recognize(pngBuf, "eng");
+        const pageText = result.data.text || "";
+        combined += pageText;
+        if (!pageText.endsWith("\n")) combined += "\n";
+        console.log("[pdf.ocr.page.completed]", {
+          ...meta,
+          page: i + 1,
+          chars: pageText.length,
+        });
+      } catch (err) {
+        console.log("[pdf.ocr.page.failed]", {
+          ...meta,
+          page: i + 1,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return {
+      text: combined.trim(),
+      pagesProcessed: files.length,
+      pagesTotal: pageCount,
+    };
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
 
 function sanitizeFilename(name: string): string {
   const cleaned = name
@@ -37,6 +196,8 @@ export type ExtractionStatus =
 
 export type ExtractionMethod =
   | "pdf_parser"
+  | "pdf_parser+ocr"
+  | "ocr"
   | "docx_parser"
   | "xlsx_parser"
   | "csv_parser"
@@ -69,6 +230,7 @@ export interface AttachmentExtractionResult {
   failure_detail: string | null;
   user_action_needed: string | null;
   extraction_method: ExtractionMethod;
+  text_extracted: boolean;
   text_quality: "high" | "medium" | "low" | "unknown";
   contains_structured_data: boolean;
   structured_data_type: "table" | "spreadsheet" | "json" | "xml" | "none";
@@ -141,6 +303,7 @@ function makeLogEntry(
     event_type: eventType,
     status,
     extraction_method: null,
+    text_extracted: false,
     duration_ms: Date.now() - startTime,
     error_category: null,
     error_message: null,
@@ -273,6 +436,7 @@ export async function extractAttachmentContent(
       user_action_needed:
         "Attachment exceeded configured size limit and was skipped. Increase max size or process manually.",
       extraction_method: "none",
+      text_extracted: false,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -314,6 +478,7 @@ export async function extractAttachmentContent(
       user_action_needed:
         "OCR is not supported in this build. Convert image content to text manually or use a dedicated OCR tool.",
       extraction_method: "none",
+      text_extracted: false,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -352,6 +517,7 @@ export async function extractAttachmentContent(
       failure_detail: `No parser available for ${mimeType}`,
       user_action_needed: `Attachment type .${fileExtension} is not yet supported for text extraction. Raw metadata exported only.`,
       extraction_method: "none",
+      text_extracted: false,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -375,6 +541,7 @@ export async function extractAttachmentContent(
         "No Gmail attachment ID available to download this attachment",
       user_action_needed: null,
       extraction_method: "none",
+      text_extracted: false,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -448,6 +615,7 @@ export async function extractAttachmentContent(
       user_action_needed:
         "Retry the export. If the error persists, the attachment may have been deleted.",
       extraction_method: "none",
+      text_extracted: false,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -495,6 +663,7 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "plain_text",
+        text_extracted: true,
         text_quality: "high",
         contains_structured_data: false,
         structured_data_type: "none",
@@ -530,6 +699,7 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "html_to_text",
+        text_extracted: true,
         text_quality: "high",
         contains_structured_data: false,
         structured_data_type: "none",
@@ -564,6 +734,7 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "csv_parser",
+        text_extracted: true,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "table",
@@ -603,6 +774,7 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "json_parser",
+        text_extracted: true,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "json",
@@ -639,6 +811,7 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "xml_parser",
+        text_extracted: true,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "xml",
@@ -681,6 +854,16 @@ export async function extractAttachmentContent(
           ...pdfLogMeta,
           action: "skip_no_decryption_attempted",
         });
+        console.log("[pdf.page_count.fallback.started]", pdfLogMeta);
+        const encryptedPageCount = await getPdfPageCount(attachmentData);
+        if (encryptedPageCount === null) {
+          console.log("[pdf.page_count.fallback.failed]", pdfLogMeta);
+        } else {
+          console.log("[pdf.page_count.fallback.completed]", {
+            ...pdfLogMeta,
+            pages: encryptedPageCount,
+          });
+        }
         const userAction =
           "PDF is password-protected. Open the file in a PDF reader, save an unsecured copy with the owner's authorisation, then re-export.";
         processingLog.push(
@@ -710,10 +893,11 @@ export async function extractAttachmentContent(
             "PDF is encrypted. This exporter does not attempt to decrypt protected PDFs.",
           user_action_needed: userAction,
           extraction_method: "pdf_parser",
+          text_extracted: false,
           text_quality: "unknown",
           contains_structured_data: false,
           structured_data_type: "none",
-          page_count: null,
+          page_count: encryptedPageCount,
           sheet_names: null,
           extracted_text: null,
           structured_data: null,
@@ -797,6 +981,16 @@ export async function extractAttachmentContent(
           : isCorrupt
             ? "PDF appears corrupt or malformed. Try opening and re-saving the file in a PDF reader, then re-export."
             : `PDF parsing failed: ${errMsg}`;
+        console.log("[pdf.page_count.fallback.started]", pdfLogMeta);
+        const failedPageCount = await getPdfPageCount(attachmentData);
+        if (failedPageCount === null) {
+          console.log("[pdf.page_count.fallback.failed]", pdfLogMeta);
+        } else {
+          console.log("[pdf.page_count.fallback.completed]", {
+            ...pdfLogMeta,
+            pages: failedPageCount,
+          });
+        }
         processingLog.push(
           makeLogEntry(
             messageId,
@@ -823,10 +1017,11 @@ export async function extractAttachmentContent(
           failure_detail: errMsg,
           user_action_needed: userAction,
           extraction_method: "pdf_parser",
+          text_extracted: false,
           text_quality: "unknown",
           contains_structured_data: false,
           structured_data_type: "none",
-          page_count: null,
+          page_count: failedPageCount,
           sheet_names: null,
           extracted_text: null,
           structured_data: null,
@@ -834,6 +1029,186 @@ export async function extractAttachmentContent(
         };
       }
       const text = pdfData.text.trim();
+      // Page count: trust pdf-parse, but fall back to pdfinfo / byte-scan if missing.
+      let resolvedPageCount: number | null =
+        typeof pdfData.numpages === "number" && pdfData.numpages > 0
+          ? pdfData.numpages
+          : null;
+      if (resolvedPageCount === null) {
+        console.log("[pdf.page_count.fallback.started]", pdfLogMeta);
+        resolvedPageCount = await getPdfPageCount(attachmentData);
+        if (resolvedPageCount === null) {
+          console.log("[pdf.page_count.fallback.failed]", pdfLogMeta);
+        } else {
+          console.log("[pdf.page_count.fallback.completed]", {
+            ...pdfLogMeta,
+            pages: resolvedPageCount,
+          });
+        }
+      }
+
+      // OCR fallback: trigger when pdf-parse extracted little or no text.
+      if (text.length < OCR_TRIGGER_CHAR_THRESHOLD) {
+        console.log("[pdf.ocr.triggered]", {
+          ...pdfLogMeta,
+          parserChars: text.length,
+          threshold: OCR_TRIGGER_CHAR_THRESHOLD,
+          reason: "scanned_or_image_only_pdf",
+        });
+        try {
+          const ocrResult = await ocrPdf(attachmentData, {
+            messageId,
+            attachmentId,
+            filename,
+          });
+          const ocrText = ocrResult.text;
+          if (resolvedPageCount === null && ocrResult.pagesTotal !== null) {
+            resolvedPageCount = ocrResult.pagesTotal;
+          }
+          if (ocrText.length === 0) {
+            console.log("[pdf.ocr.completed_empty]", {
+              ...pdfLogMeta,
+              pagesProcessed: ocrResult.pagesProcessed,
+            });
+            const userAction =
+              "PDF appears to be a scanned/image-based document and OCR could not recognise any text. Verify the source document quality.";
+            processingLog.push(
+              makeLogEntry(
+                messageId,
+                attachmentId,
+                filename,
+                "attachment_extraction_failed",
+                "failed",
+                startTime,
+                {
+                  extraction_method: "ocr",
+                  error_category: "ocr_failed",
+                  error_message: "OCR returned no text.",
+                  user_action_needed: userAction,
+                },
+              ),
+            );
+            return {
+              ...base,
+              is_supported: true,
+              was_downloaded: true,
+              extraction_status: "failed",
+              skip_reason: null,
+              failure_category: "ocr_failed",
+              failure_detail: "OCR processed all pages but extracted no text.",
+              user_action_needed: userAction,
+              extraction_method: "ocr",
+              text_extracted: false,
+              text_quality: "unknown",
+              contains_structured_data: false,
+              structured_data_type: "none",
+              page_count: resolvedPageCount,
+              sheet_names: null,
+              extracted_text: null,
+              structured_data: null,
+              warnings: [],
+              errors: ["OCR returned no text"],
+            };
+          }
+          console.log("[pdf.ocr.completed]", {
+            ...pdfLogMeta,
+            pagesProcessed: ocrResult.pagesProcessed,
+            chars: ocrText.length,
+          });
+          const ocrQuality =
+            ocrText.length < 200
+              ? "low"
+              : ocrText.length < 2000
+                ? "medium"
+                : "high";
+          processingLog.push(
+            makeLogEntry(
+              messageId,
+              attachmentId,
+              filename,
+              "attachment_extraction_completed",
+              "success",
+              startTime,
+              { extraction_method: "ocr" },
+            ),
+          );
+          return {
+            ...base,
+            is_supported: true,
+            was_downloaded: true,
+            extraction_status: "success",
+            skip_reason: null,
+            failure_category: null,
+            failure_detail: null,
+            user_action_needed: null,
+            extraction_method:
+              text.length > 0 ? "pdf_parser+ocr" : "ocr",
+            text_extracted: true,
+            text_quality: ocrQuality,
+            contains_structured_data: false,
+            structured_data_type: "none",
+            page_count: resolvedPageCount,
+            sheet_names: null,
+            extracted_text: ocrText,
+            structured_data: null,
+            warnings: [
+              `pdf-parse extracted only ${text.length} chars; OCR fallback used (${ocrResult.pagesProcessed} pages processed${
+                ocrResult.pagesTotal && ocrResult.pagesTotal > ocrResult.pagesProcessed
+                  ? `, ${ocrResult.pagesTotal - ocrResult.pagesProcessed} pages skipped due to ${OCR_MAX_PAGES}-page OCR cap`
+                  : ""
+              }).`,
+            ],
+            errors: [],
+          };
+        } catch (ocrErr) {
+          const errMsg =
+            ocrErr instanceof Error ? ocrErr.message : String(ocrErr);
+          console.log("[pdf.ocr.failed]", {
+            ...pdfLogMeta,
+            error: errMsg,
+          });
+          const userAction =
+            "PDF appears to be a scanned/image-based document and OCR failed. Verify the source document is not corrupt and try again.";
+          processingLog.push(
+            makeLogEntry(
+              messageId,
+              attachmentId,
+              filename,
+              "attachment_extraction_failed",
+              "failed",
+              startTime,
+              {
+                extraction_method: "ocr",
+                error_category: "ocr_failed",
+                error_message: errMsg,
+                user_action_needed: userAction,
+              },
+            ),
+          );
+          return {
+            ...base,
+            is_supported: true,
+            was_downloaded: true,
+            extraction_status: "failed",
+            skip_reason: null,
+            failure_category: "ocr_failed",
+            failure_detail: errMsg,
+            user_action_needed: userAction,
+            extraction_method: "ocr",
+            text_extracted: false,
+            text_quality: "unknown",
+            contains_structured_data: false,
+            structured_data_type: "none",
+            page_count: resolvedPageCount,
+            sheet_names: null,
+            extracted_text: null,
+            structured_data: null,
+            warnings: [],
+            errors: [errMsg],
+          };
+        }
+      }
+
       const quality =
         text.length < 50 ? "low" : text.length < 500 ? "medium" : "high";
       processingLog.push(
@@ -857,10 +1232,11 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "pdf_parser",
+        text_extracted: true,
         text_quality: quality,
         contains_structured_data: false,
         structured_data_type: "none",
-        page_count: pdfData.numpages,
+        page_count: resolvedPageCount,
         sheet_names: null,
         extracted_text: text || null,
         structured_data: null,
@@ -915,6 +1291,7 @@ export async function extractAttachmentContent(
           failure_detail: errMsg,
           user_action_needed: userAction,
           extraction_method: "docx_parser",
+          text_extracted: false,
           text_quality: "unknown",
           contains_structured_data: false,
           structured_data_type: "none",
@@ -947,6 +1324,7 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "docx_parser",
+        text_extracted: true,
         text_quality: "high",
         contains_structured_data: false,
         structured_data_type: "none",
@@ -1006,6 +1384,7 @@ export async function extractAttachmentContent(
           failure_detail: errMsg,
           user_action_needed: userAction,
           extraction_method: "xlsx_parser",
+          text_extracted: false,
           text_quality: "unknown",
           contains_structured_data: true,
           structured_data_type: "spreadsheet",
@@ -1051,6 +1430,7 @@ export async function extractAttachmentContent(
         failure_detail: null,
         user_action_needed: null,
         extraction_method: "xlsx_parser",
+        text_extracted: true,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "spreadsheet",
@@ -1073,6 +1453,7 @@ export async function extractAttachmentContent(
       failure_detail: null,
       user_action_needed: null,
       extraction_method: "none",
+      text_extracted: true,
       text_quality: "low",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -1112,6 +1493,7 @@ export async function extractAttachmentContent(
       user_action_needed:
         "An unexpected error occurred during extraction. Retry the export.",
       extraction_method: "none",
+      text_extracted: false,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",

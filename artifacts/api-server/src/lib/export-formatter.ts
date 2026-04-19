@@ -569,7 +569,7 @@ export function buildAttachmentsIndex(
         sha256: att.sha256,
         storage_path: att.storage_path,
         is_embedded: att.is_embedded,
-        text_extracted: att.extraction_status === "success" && !!att.extracted_text,
+        text_extracted: att.text_extracted,
         parse_status: att.extraction_status,
         parse_method: att.extraction_method,
         failure_category: att.failure_category,
