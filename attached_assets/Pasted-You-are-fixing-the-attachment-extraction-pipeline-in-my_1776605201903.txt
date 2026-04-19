@@ -1,0 +1,136 @@
+You are fixing the attachment extraction pipeline in my existing Replit Node.js / Express project.
+
+Important constraints:
+- Do NOT bypass, crack, or weaken PDF security.
+- Do NOT attempt password guessing, brute force, or protection removal.
+- Only process PDFs normally if they are not encrypted, or if I explicitly provide an authorised password through configuration.
+- Preserve all existing routes and functionality.
+
+Current evidence from the latest export:
+- attachments are being detected and downloaded successfully
+- extraction then fails with the error: "pdfParse is not a function"
+- attachment_extracted_success_count is 0
+- attachment_failure_count is 4
+- full_export shows was_downloaded: true but extraction_status: "failed" and extracted_text: null
+
+PRIMARY OBJECTIVE
+
+Fix the PDF extraction pipeline so it:
+1. correctly parses normal PDFs
+2. correctly detects encrypted/password-protected PDFs
+3. cleanly reports protected PDFs without pretending extraction succeeded
+4. optionally parses protected PDFs only when an authorised password is supplied by configuration
+
+NON-NEGOTIABLE REQUIREMENTS
+
+1. INSPECT THE REAL CURRENT CODE
+- Find the actual attachment extraction helper and the current pdf parsing code
+- Find where pdf-parse (or equivalent) is imported and called
+- Fix the real code, not example code
+
+2. FIX THE CURRENT PARSER BUG FIRST
+- The current error is "pdfParse is not a function"
+- Diagnose the import/export mismatch or runtime incompatibility
+- Add a temporary debug log to capture:
+  - typeof pdfParse
+  - module keys / export shape
+  - which parser path is being used
+- Remove or reduce noisy debug logging once fixed
+
+3. ADD PDF ENCRYPTION DETECTION
+- Before parsing, determine whether a PDF is encrypted or password protected
+- If encrypted and no authorised password is provided:
+  - do not parse
+  - mark extraction_status = "failed" or "skipped" according to current schema conventions
+  - set failure_category = "encrypted_or_password_protected"
+  - set a clear failure_detail / user_action_needed message
+- If encrypted and an authorised password is provided through config:
+  - attempt normal library-supported opening using that password only
+  - do not do any guessing or bypassing
+- If not encrypted:
+  - parse normally
+
+4. CONFIGURATION
+Add support for an optional environment variable such as:
+- PDF_PASSWORD
+or, if better for the codebase:
+- PDF_PASSWORDS as a JSON array or map
+
+Requirements:
+- do not hardcode passwords
+- do not log the raw password
+- if a password is present, only log that an authorised password was supplied, not its value
+
+5. STRUCTURED RESULTS
+For each attachment record, populate fields clearly:
+- was_downloaded
+- extraction_status
+- failure_category
+- failure_detail
+- user_action_needed
+- extraction_method
+- extracted_text
+- page_count if available
+
+For protected PDFs without password:
+- extraction_status should not pretend success
+- extracted_text must remain null or empty
+- failure_category should clearly indicate protection
+
+6. LOGGING
+Add step-based logs around PDF handling:
+- pdf.inspect.started
+- pdf.inspect.completed
+- pdf.detected_encrypted
+- pdf.password_supplied
+- pdf.parse.started
+- pdf.parse.completed
+- pdf.parse.failed
+
+Each log should include useful metadata:
+- requestId if available
+- messageId
+- attachmentId
+- filename
+- size
+- parser name
+- error message
+- stack when relevant
+
+7. EXPORT ACCURACY
+Ensure the exported JSON truthfully reflects what happened:
+- downloaded-only attachments must not appear as text-extracted
+- attachment_text_combined should only include successfully extracted attachment text
+- manifest counts must be correct for success/failure/protected cases
+
+8. TEST AGAINST THE REAL REVOLUT EMAIL EXPORT
+Re-run the same export after the fix and confirm which of these is true:
+- Case A: PDFs parse successfully and extracted_text is populated
+- Case B: PDFs are genuinely encrypted/password-protected and are reported as such
+- Case C: some parse and some are protected
+
+9. OUTPUT
+When finished, provide:
+A. exact root cause of the current failure
+B. exact files changed
+C. summary of code changes
+D. whether the PDFs were actually protected or whether the issue was only the parser bug
+E. sample output showing one attachment result after the fix
+
+WORKING METHOD
+
+1. Inspect current parser/import code
+2. Fix the "pdfParse is not a function" issue
+3. Add encryption detection
+4. Add optional authorised-password support via env var only
+5. Re-run extraction
+6. Confirm the export schema now reflects reality
+7. Do not stop at diagnosis; make real code changes
+
+ACCEPTANCE CRITERIA
+
+- The "pdfParse is not a function" error is eliminated
+- Normal PDFs extract text successfully
+- Encrypted/password-protected PDFs are explicitly identified
+- No bypassing/cracking logic is introduced
+- Export counts and attachment metadata are truthful

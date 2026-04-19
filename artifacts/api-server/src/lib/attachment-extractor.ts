@@ -11,6 +11,34 @@ function sanitizeFilename(name: string): string {
   return cleaned.length > 0 ? cleaned.slice(0, 200) : "unnamed";
 }
 
+async function parseWithPdfjsLegacy(
+  data: Buffer,
+  password: string,
+): Promise<{ text: string; numpages: number }> {
+  const pdfjs: typeof import("pdfjs-dist/legacy/build/pdf.js") = await import(
+    "pdfjs-dist/legacy/build/pdf.js"
+  );
+  const uint8 = new Uint8Array(data);
+  const loadingTask = pdfjs.getDocument({
+    data: uint8,
+    password,
+    isEvalSupported: false,
+    disableFontFace: true,
+    useSystemFonts: false,
+  });
+  const doc = await loadingTask.promise;
+  let text = "";
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const content = await page.getTextContent();
+    const pageText = content.items
+      .map((it) => ("str" in it ? (it as { str: string }).str : ""))
+      .join(" ");
+    text += pageText + "\n\n";
+  }
+  return { text, numpages: doc.numPages };
+}
+
 function sha256Hex(buf: Buffer): string {
   return createHash("sha256").update(buf).digest("hex");
 }
@@ -651,91 +679,177 @@ export async function extractAttachmentContent(
 
     // PDF
     if (mimeType === "application/pdf") {
-      // Import directly from lib/ to avoid pdf-parse v1's index.js debug-mode
-      // side effect that tries to read a hard-coded test file at startup.
-      const pdfParseModule: unknown = await import(
-        "pdf-parse/lib/pdf-parse.js"
-      );
-
-      const moduleCandidate = pdfParseModule as {
-        default?: unknown;
-        pdfParse?: unknown;
+      const pdfLogMeta = {
+        messageId,
+        attachmentId,
+        filename,
+        size: attachmentData.length,
       };
 
-      const pdfParseRaw =
-        typeof moduleCandidate === "function"
-          ? moduleCandidate
-          : typeof moduleCandidate.default === "function"
-            ? moduleCandidate.default
-            : typeof (moduleCandidate.default as { default?: unknown })
-                  ?.default === "function"
-              ? (moduleCandidate.default as { default: unknown }).default
-              : typeof moduleCandidate.pdfParse === "function"
-                ? moduleCandidate.pdfParse
-                : typeof (moduleCandidate.default as { pdfParse?: unknown })
-                      ?.pdfParse === "function"
-                  ? (moduleCandidate.default as { pdfParse: unknown }).pdfParse
-                  : null;
+      console.log("[pdf.inspect.started]", pdfLogMeta);
 
-      console.log("[pdf-extract] module-shape", {
-        moduleType: typeof pdfParseModule,
-        moduleKeys:
-          pdfParseModule && typeof pdfParseModule === "object"
-            ? Object.keys(pdfParseModule as Record<string, unknown>)
-            : [],
-        defaultType:
-          moduleCandidate && "default" in moduleCandidate
-            ? typeof moduleCandidate.default
-            : "missing",
-        resolvedType: typeof pdfParseRaw,
+      // --- Encryption detection (no bypass: only reads the PDF dictionary marker)
+      const headSlice = attachmentData
+        .subarray(0, Math.min(attachmentData.length, 4096))
+        .toString("latin1");
+      const tailSlice = attachmentData
+        .subarray(Math.max(0, attachmentData.length - 4096))
+        .toString("latin1");
+      const looksEncrypted =
+        /\/Encrypt\s/.test(headSlice) || /\/Encrypt\s/.test(tailSlice);
+
+      // PDF_PASSWORD env var: presence only — never log the value.
+      const authorisedPassword =
+        typeof process.env.PDF_PASSWORD === "string" &&
+        process.env.PDF_PASSWORD.length > 0
+          ? process.env.PDF_PASSWORD
+          : null;
+      const passwordProvided = authorisedPassword !== null;
+
+      console.log("[pdf.inspect.completed]", {
+        ...pdfLogMeta,
+        encrypted: looksEncrypted,
+        passwordProvided,
       });
 
-      if (typeof pdfParseRaw !== "function") {
-        throw new Error(
-          `pdf-parse export could not be resolved to a callable function.`,
+      // Branch 1: encrypted + no password → clean failure, no parse attempt
+      if (looksEncrypted && !passwordProvided) {
+        console.log("[pdf.detected_encrypted]", {
+          ...pdfLogMeta,
+          action: "skip_no_password",
+        });
+        const userAction =
+          "PDF is password-protected. Set the PDF_PASSWORD environment variable with the authorised password and re-run, or export an unsecured copy.";
+        processingLog.push(
+          makeLogEntry(
+            messageId,
+            attachmentId,
+            filename,
+            "attachment_extraction_failed",
+            "failed",
+            startTime,
+            {
+              extraction_method: "pdf_parser",
+              error_category: "encrypted_or_password_protected",
+              error_message: "PDF is encrypted; no PDF_PASSWORD configured.",
+              user_action_needed: userAction,
+            },
+          ),
         );
+        return {
+          ...base,
+          is_supported: true,
+          was_downloaded: true,
+          extraction_status: "failed",
+          skip_reason: null,
+          failure_category: "encrypted_or_password_protected",
+          failure_detail:
+            "PDF is encrypted; no authorised password supplied (set PDF_PASSWORD env var to attempt).",
+          user_action_needed: userAction,
+          extraction_method: "pdf_parser",
+          text_quality: "unknown",
+          contains_structured_data: false,
+          structured_data_type: "none",
+          page_count: null,
+          sheet_names: null,
+          extracted_text: null,
+          structured_data: null,
+          errors: ["PDF encrypted, no password configured"],
+        };
       }
 
-      const pdfParse = pdfParseRaw as (
-        data: Buffer,
-        opts?: Record<string, unknown>,
-      ) => Promise<{ text: string; numpages: number }>;
+      // Branch 2: encrypted + password supplied → use pdfjs-dist legacy with password
       let pdfData: { text: string; numpages: number };
+      let parserUsed: "pdf-parse@1" | "pdfjs-dist@legacy" = "pdf-parse@1";
+
       try {
-        if (typeof pdfParse !== "function") {
-          throw new Error(
-            `pdf-parse export is not callable (got ${typeof pdfParse}). Check pdf-parse version — expected v1.x.`,
+        if (looksEncrypted && passwordProvided) {
+          console.log("[pdf.password_supplied]", {
+            ...pdfLogMeta,
+            note: "authorised password present; attempting parse",
+          });
+          parserUsed = "pdfjs-dist@legacy";
+          console.log("[pdf.parse.started]", {
+            ...pdfLogMeta,
+            parser: parserUsed,
+          });
+          pdfData = await parseWithPdfjsLegacy(
+            attachmentData,
+            authorisedPassword!,
           );
+        } else {
+          // Branch 3: not encrypted → normal pdf-parse path
+          console.log("[pdf.parse.started]", {
+            ...pdfLogMeta,
+            parser: parserUsed,
+          });
+          // Import directly from lib/ to avoid pdf-parse v1's index.js debug-mode
+          // side effect that tries to read a hard-coded test file at startup.
+          const pdfParseModule: unknown = await import(
+            "pdf-parse/lib/pdf-parse.js"
+          );
+          const moduleCandidate = pdfParseModule as {
+            default?: unknown;
+            pdfParse?: unknown;
+          };
+          const pdfParseRaw =
+            typeof moduleCandidate === "function"
+              ? moduleCandidate
+              : typeof moduleCandidate.default === "function"
+                ? moduleCandidate.default
+                : typeof (moduleCandidate.default as { default?: unknown })
+                      ?.default === "function"
+                  ? (moduleCandidate.default as { default: unknown }).default
+                  : typeof moduleCandidate.pdfParse === "function"
+                    ? moduleCandidate.pdfParse
+                    : null;
+          if (typeof pdfParseRaw !== "function") {
+            throw new Error(
+              `pdf-parse export is not callable (got ${typeof pdfParseRaw}). Check pdf-parse version — expected v1.x.`,
+            );
+          }
+          const pdfParse = pdfParseRaw as (
+            data: Buffer,
+            opts?: Record<string, unknown>,
+          ) => Promise<{ text: string; numpages: number }>;
+          pdfData = await pdfParse(attachmentData);
         }
-        pdfData = await pdfParse(attachmentData);
-        console.log(
-          `[pdf-extract] parser=pdf-parse@1 status=success pages=${pdfData.numpages} chars=${pdfData.text.length} file="${filename}"`,
-        );
+        console.log("[pdf.parse.completed]", {
+          ...pdfLogMeta,
+          parser: parserUsed,
+          pages: pdfData.numpages,
+          chars: pdfData.text.length,
+        });
       } catch (pdfErr) {
-        const errMsgRaw =
-          pdfErr instanceof Error ? pdfErr.message : String(pdfErr);
-        console.log(
-          `[pdf-extract] parser=pdf-parse@1 status=failed file="${filename}" error="${errMsgRaw}"`,
-        );
         const errMsg =
           pdfErr instanceof Error ? pdfErr.message : String(pdfErr);
+        const errStack = pdfErr instanceof Error ? pdfErr.stack : undefined;
+        console.log("[pdf.parse.failed]", {
+          ...pdfLogMeta,
+          parser: parserUsed,
+          error: errMsg,
+          stack: errStack,
+        });
+        const lowered = errMsg.toLowerCase();
         const isEncrypted =
-          errMsg.toLowerCase().includes("encrypt") ||
-          errMsg.toLowerCase().includes("password") ||
-          errMsg.toLowerCase().includes("protected");
+          lowered.includes("encrypt") ||
+          lowered.includes("password") ||
+          lowered.includes("protected");
         const isCorrupt =
-          errMsg.toLowerCase().includes("invalid") ||
-          errMsg.toLowerCase().includes("corrupt") ||
-          errMsg.toLowerCase().includes("malformed");
+          lowered.includes("invalid") ||
+          lowered.includes("corrupt") ||
+          lowered.includes("malformed");
         const category: FailureCategory = isEncrypted
           ? "encrypted_or_password_protected"
           : isCorrupt
             ? "corrupt_or_malformed"
             : "parser_error";
         const userAction = isEncrypted
-          ? "Password protected PDF could not be opened. Remove the password or export an unsecured copy and rerun."
+          ? passwordProvided
+            ? "Authorised password did not unlock the PDF. Verify PDF_PASSWORD matches the document password, or export an unsecured copy."
+            : "Password protected PDF could not be opened. Set PDF_PASSWORD env var or export an unsecured copy and rerun."
           : isCorrupt
-            ? "Spreadsheet is corrupted or unreadable. Open and resave the file in a compatible app, then rerun."
+            ? "PDF appears corrupt or malformed. Try opening and re-saving the file in a PDF reader, then re-export."
             : `PDF parsing failed: ${errMsg}`;
         processingLog.push(
           makeLogEntry(
