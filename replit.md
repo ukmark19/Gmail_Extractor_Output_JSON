@@ -29,6 +29,8 @@ A production-quality Gmail search and export tool for power users. Allows advanc
 - `artifacts/api-server/src/lib/gmail.ts` — OAuth client, HTML stripping, email part extraction
 - `artifacts/api-server/src/lib/query-builder.ts` — Gmail query string builder
 - `artifacts/api-server/src/lib/export-formatter.ts` — JSON export formatters (raw, AI-optimized, JSONL)
+- `artifacts/api-server/src/lib/safe-json.ts` — Safe-JSON serialization layer. `serializeJsonSafe()` refuses `undefined`, validates expected shape (`array`|`object`), and runs a `JSON.parse` roundtrip so a literal `undefined` token can never reach a file. The export route routes every section through this helper before streaming the ZIP and returns HTTP 500 with the exact message `"Export failed: export data was undefined before file write."` on any validation failure.
+- `artifacts/api-server/src/lib/export-zip.ts` — ZIP streamer; takes pre-serialized `SerializedBundleEntries` (no `JSON.stringify` inside) and gates each entry with `assertNonEmptyString` before archive creation.
 - `artifacts/api-server/src/routes/auth.ts` — Google OAuth routes
 - `artifacts/api-server/src/routes/gmail.ts` — Gmail search, message detail, labels
 - `artifacts/api-server/src/routes/export.ts` — Email export endpoint

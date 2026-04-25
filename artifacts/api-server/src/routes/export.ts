@@ -24,7 +24,9 @@ import {
   streamExportZipWithDiskTee,
   type AttachmentBufferEntry,
   type OcrImageEntry,
+  type SerializedBundleEntries,
 } from "../lib/export-zip.js";
+import { SafeJsonError, serializeJsonSafe } from "../lib/safe-json.js";
 import { createReadStream, existsSync, statSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -798,6 +800,144 @@ router.post(
           );
         }
       }
+      // ----------------------------------------------------------------
+      // PRE-WRITE JSON SAFETY GATE
+      //
+      // Build & validate every JSON section BEFORE any byte of the ZIP
+      // (or response headers) is sent. This is the single chokepoint
+      // that stops `JSON.stringify(undefined)` ever being passed to
+      // archiver — which is what wrote the literal text "undefined"
+      // into full_export.json and export_manifest.json in production.
+      //
+      // If any section fails to serialize, we emit an
+      // `export_json_validation_failed` log entry and return HTTP 500
+      // with the exact wording requested. The user sees a real error
+      // instead of downloading a broken ZIP.
+      // ----------------------------------------------------------------
+      processingLog.push(
+        makeLog("", null, null, "export_data_built", "ok", {
+          duration_ms: Date.now() - exportStart,
+          error_message: JSON.stringify({
+            full_export_length: Array.isArray(bundle.fullExport)
+              ? bundle.fullExport.length
+              : null,
+            attachments_index_length: Array.isArray(bundle.attachmentsIndex)
+              ? bundle.attachmentsIndex.length
+              : null,
+            errors_report_length: Array.isArray(bundle.errorsReport)
+              ? bundle.errorsReport.length
+              : null,
+          }),
+        }),
+      );
+      processingLog.push(
+        makeLog("", null, null, "export_json_validation_started", "ok", {
+          duration_ms: Date.now() - exportStart,
+        }),
+      );
+
+      let serialized: SerializedBundleEntries;
+      try {
+        // Note on shapes: full_export, attachments_index and
+        // errors_report are arrays (possibly empty); manifest is an
+        // object; processing_log is an array (re-serialized below to
+        // include the terminal events). ai_ingestion is JSONL (one
+        // JSON object per line, joined by "\n") and is therefore
+        // already a string; the streamer's assertNonEmptyString gate
+        // verifies it is non-empty before append. Any failure here
+        // is caught and surfaces as HTTP 500 with the exact wording
+        // requested ("Export failed: export data was undefined
+        // before file write.").
+        const fullExportJson = serializeJsonSafe(
+          bundle.fullExport,
+          "full_export.json",
+          { expect: "array" },
+        );
+        const manifestJson = serializeJsonSafe(
+          bundle.manifest,
+          "export_manifest.json",
+          { expect: "object" },
+        );
+        const attachmentsIndexJson = serializeJsonSafe(
+          bundle.attachmentsIndex,
+          "attachments_index.json",
+          { expect: "array" },
+        );
+        const processingLogJson = serializeJsonSafe(
+          processingLog,
+          "processing_log.json",
+          { expect: "array" },
+        );
+        const errorsReportJson = serializeJsonSafe(
+          bundle.errorsReport,
+          "errors_report.json",
+          { expect: "array" },
+        );
+        if (typeof bundle.aiIngestion !== "string") {
+          throw new SafeJsonError(
+            "ai_ingestion.jsonl",
+            `Expected aiIngestion to be a string, got ${
+              bundle.aiIngestion === undefined
+                ? "undefined"
+                : typeof bundle.aiIngestion
+            }.`,
+          );
+        }
+        serialized = {
+          fullExportJson,
+          aiIngestion: bundle.aiIngestion,
+          attachmentsIndexJson,
+          manifestJson,
+          processingLogJson,
+          errorsReportJson,
+        };
+      } catch (jsonErr) {
+        const which =
+          jsonErr instanceof SafeJsonError ? jsonErr.safeJsonName : "unknown";
+        const detail =
+          jsonErr instanceof Error ? jsonErr.message : String(jsonErr);
+        processingLog.push(
+          makeLog("", null, null, "export_json_validation_failed", "failed", {
+            error_category: "manifest_reconciliation",
+            error_message: JSON.stringify({ section: which, detail }),
+          }),
+        );
+        req.log.error(
+          { err: jsonErr, section: which },
+          "[export] pre-write JSON validation failed; refusing to write ZIP",
+        );
+        // Headers have NOT been set yet (we're still pre-stream), so we
+        // can return a real JSON error to the client.
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: "Export failed: export data was undefined before file write.",
+            detail,
+            section: which,
+            processingLog,
+          });
+        } else {
+          res.destroy(jsonErr instanceof Error ? jsonErr : new Error(detail));
+        }
+        return;
+      }
+
+      // Push BOTH terminal log events BEFORE we re-serialize the
+      // processing_log so they make it into the ZIP entry. Anything
+      // pushed after this point (e.g. `export_file_written`, which is
+      // logically post-stream) goes only to console / req.log.
+      processingLog.push(
+        makeLog("", null, null, "export_file_validation_completed", "ok", {
+          duration_ms: Date.now() - exportStart,
+          error_message: JSON.stringify({
+            full_export_bytes: serialized.fullExportJson.length,
+            manifest_bytes: serialized.manifestJson.length,
+            attachments_index_bytes: serialized.attachmentsIndexJson.length,
+            processing_log_bytes: serialized.processingLogJson.length,
+            errors_report_bytes: serialized.errorsReportJson.length,
+            ai_ingestion_bytes: serialized.aiIngestion.length,
+          }),
+        }),
+      );
       processingLog.push(
         makeLog("", null, null, "export_completed", "success", {
           duration_ms: Date.now() - exportStart,
@@ -809,6 +949,34 @@ router.post(
           }),
         }),
       );
+
+      // Final re-serialization of processing_log so the snapshot inside
+      // the ZIP includes the `export_file_validation_completed` and
+      // `export_completed` events that were just pushed. Routed through
+      // the same `serializeJsonSafe` chokepoint so the validation
+      // guarantee still holds.
+      try {
+        const finalProcessingLogJson = serializeJsonSafe(
+          processingLog,
+          "processing_log.json",
+          { expect: "array" },
+        );
+        serialized = { ...serialized, processingLogJson: finalProcessingLogJson };
+      } catch (jsonErr) {
+        const detail =
+          jsonErr instanceof Error ? jsonErr.message : String(jsonErr);
+        if (!res.headersSent) {
+          res.status(500).json({
+            error: "Export failed: export data was undefined before file write.",
+            detail,
+            section: "processing_log.json",
+            processingLog,
+          });
+        } else {
+          res.destroy(jsonErr instanceof Error ? jsonErr : new Error(detail));
+        }
+        return;
+      }
 
       // Final structured console summary
       const m = bundle.manifest;
@@ -909,12 +1077,11 @@ router.post(
 
       try {
         const persistResult = await streamExportZipWithDiskTee(
-          bundle,
+          serialized,
           dedupedBuffers,
           rootDir,
           res,
           ocrImages,
-          bundle.errorsReport,
           {
             // Per-user root: prevents cross-user PII leakage via the
             // /api/gmail/export/latest endpoint.
@@ -925,7 +1092,8 @@ router.post(
         );
         // After-the-fact log so the saved processing_log inside this run does
         // NOT contain the entry (it's already streamed); but we do print it
-        // for ops visibility.
+        // for ops visibility. The `export_file_written` event is the
+        // post-stream confirmation that on-disk JSON+attachments landed.
         req.log.info(
           {
             export_id: bundle.exportId,
@@ -934,6 +1102,8 @@ router.post(
             timestamped_path: persistResult.timestampedPath,
             latest_path: persistResult.latestPath,
             bytes_written: persistResult.bytesWritten,
+            entry_count: persistResult.entryCount,
+            event_type: "export_file_written",
           },
           "[export] zip stream + disk persist completed",
         );

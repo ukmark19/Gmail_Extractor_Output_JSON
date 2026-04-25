@@ -4,7 +4,6 @@ import { createWriteStream, existsSync, mkdirSync } from "node:fs";
 import { copyFile, mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
-import type { ExportBundle } from "./export-formatter.js";
 
 export interface AttachmentBufferEntry {
   storagePath: string; // e.g. extracted_attachments/<msg>/<...>
@@ -23,6 +22,37 @@ export interface OcrImageEntry {
 }
 
 /**
+ * Pre-serialized JSON entries the streamer will write into the ZIP.
+ *
+ * The route is responsible for serializing each section via
+ * `serializeJsonSafe` BEFORE calling the streamer. The streamer never
+ * calls `JSON.stringify` itself, which is what guarantees we cannot
+ * regress to writing the literal string "undefined" into a JSON entry
+ * (the original bug). Each field MUST be a non-empty string.
+ */
+export interface SerializedBundleEntries {
+  fullExportJson: string;
+  aiIngestion: string; // JSONL — one JSON object per line, newline-separated
+  attachmentsIndexJson: string;
+  manifestJson: string;
+  processingLogJson: string;
+  errorsReportJson: string;
+}
+
+function assertNonEmptyString(value: unknown, fieldName: string): void {
+  if (typeof value !== "string") {
+    throw new Error(
+      `streamExportZip: "${fieldName}" must be a string, got ${
+        value === undefined ? "undefined" : value === null ? "null" : typeof value
+      }.`,
+    );
+  }
+  if (value.length === 0) {
+    throw new Error(`streamExportZip: "${fieldName}" must not be empty.`);
+  }
+}
+
+/**
  * Stream the export bundle as a ZIP into the supplied writable.
  * The ZIP is rooted at `<rootDirName>/` and contains:
  *   - full_export.json
@@ -35,13 +65,24 @@ export interface OcrImageEntry {
  *   - ocr_images/<messageId>/<attachmentId>/page_<n>.png  (when PDF was rasterised)
  */
 export async function streamExportZip(
-  bundle: ExportBundle,
+  entries: SerializedBundleEntries,
   attachmentBuffers: AttachmentBufferEntry[],
   rootDirName: string,
   out: Writable,
   ocrImages: OcrImageEntry[] = [],
-  errorsReport: unknown = null,
 ): Promise<{ bytesWritten: number; entryCount: number }> {
+  // Belt-and-braces: refuse to even start the archive if the caller forgot
+  // to pre-serialize a section. Without this, archiver would happily
+  // String()-coerce undefined into the literal text "undefined" (the
+  // original bug). The route already validates upstream, but doing this
+  // here too means no future caller can re-introduce the regression.
+  assertNonEmptyString(entries.fullExportJson, "fullExportJson");
+  assertNonEmptyString(entries.aiIngestion, "aiIngestion");
+  assertNonEmptyString(entries.attachmentsIndexJson, "attachmentsIndexJson");
+  assertNonEmptyString(entries.manifestJson, "manifestJson");
+  assertNonEmptyString(entries.processingLogJson, "processingLogJson");
+  assertNonEmptyString(entries.errorsReportJson, "errorsReportJson");
+
   return new Promise((resolve, reject) => {
     const archive: Archiver = archiver("zip", { zlib: { level: 6 } });
     let entryCount = 0;
@@ -70,22 +111,22 @@ export async function streamExportZip(
 
     const root = rootDirName.replace(/\/+$/, "");
 
-    archive.append(JSON.stringify(bundle.fullExport, null, 2), {
+    archive.append(entries.fullExportJson, {
       name: `${root}/full_export.json`,
     });
-    archive.append(bundle.aiIngestion, {
+    archive.append(entries.aiIngestion, {
       name: `${root}/ai_ingestion.jsonl`,
     });
-    archive.append(JSON.stringify(bundle.attachmentsIndex, null, 2), {
+    archive.append(entries.attachmentsIndexJson, {
       name: `${root}/attachments_index.json`,
     });
-    archive.append(JSON.stringify(bundle.manifest, null, 2), {
+    archive.append(entries.manifestJson, {
       name: `${root}/export_manifest.json`,
     });
-    archive.append(JSON.stringify(bundle.processingLog, null, 2), {
+    archive.append(entries.processingLogJson, {
       name: `${root}/processing_log.json`,
     });
-    archive.append(JSON.stringify(errorsReport ?? [], null, 2), {
+    archive.append(entries.errorsReportJson, {
       name: `${root}/errors_report.json`,
     });
 
@@ -134,12 +175,11 @@ export interface DiskPersistResult {
 }
 
 export async function streamExportZipWithDiskTee(
-  bundle: ExportBundle,
+  entries: SerializedBundleEntries,
   attachmentBuffers: AttachmentBufferEntry[],
   rootDirName: string,
   httpOut: Writable,
   ocrImages: OcrImageEntry[],
-  errorsReport: unknown,
   disk: DiskPersistOptions,
 ): Promise<DiskPersistResult & { bytesWritten: number; entryCount: number }> {
   const tsDir = join(disk.exportsRoot, `export_${disk.exportTimestamp}`);
@@ -163,12 +203,11 @@ export async function streamExportZipWithDiskTee(
   });
 
   const result = await streamExportZip(
-    bundle,
+    entries,
     attachmentBuffers,
     rootDirName,
     tee,
     ocrImages,
-    errorsReport,
   );
 
   await fileDone;
