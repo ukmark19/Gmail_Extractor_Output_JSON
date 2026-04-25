@@ -14,6 +14,7 @@
     "@types/uuid": "^11.0.0",
     "@workspace/api-zod": "workspace:*",
     "@workspace/db": "workspace:*",
+    "archiver": "^7.0.1",
     "cookie-parser": "^1.4.7",
     "cors": "^2",
     "drizzle-orm": "catalog:",
@@ -21,6 +22,7 @@
     "express-session": "^1.19.0",
     "google-auth-library": "^10.6.2",
     "googleapis": "^171.4.0",
+    "mailparser": "^3.9.8",
     "mammoth": "^1.12.0",
     "pino": "^9",
     "pino-http": "^10",
@@ -29,9 +31,11 @@
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
+    "@types/archiver": "^7.0.0",
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/mailparser": "^3.4.6",
     "@types/node": "catalog:",
     "@types/pdf-parse": "^1.1.5",
     "esbuild": "^0.27.3",

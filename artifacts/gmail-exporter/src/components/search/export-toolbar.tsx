@@ -1,17 +1,22 @@
-import { useExportEmails, getGetExportLogsQueryKey } from "@workspace/api-client-react";
+import { getGetExportLogsQueryKey } from "@workspace/api-client-react";
 import { Button } from "@/components/ui/button";
-import { Download, Loader2, X, FileArchive, CheckCircle2, AlertTriangle, FileQuestion, Mail, Paperclip, FileJson, Sparkles } from "lucide-react";
+import {
+  Download,
+  Loader2,
+  X,
+  FileArchive,
+  CheckCircle2,
+  AlertTriangle,
+  FileQuestion,
+  Mail,
+  Paperclip,
+  ShieldCheck,
+  ShieldAlert,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { useState } from "react";
 import { useToast } from "@/hooks/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -53,51 +58,34 @@ export interface ExportResult {
   };
 }
 
-type ExportMode = "raw" | "ai" | "full";
+interface SummaryStats {
+  emailsExported: number;
+  totalAttachments: number;
+  extractedSuccess: number;
+  failed: number;
+  unsupported: number;
+  zipFilename: string;
+  zipSizeBytes: number;
+  exportId: string;
+  validationStatus: string;
+}
 
-const EXPORT_MODES: Record<ExportMode, { label: string; short: string; description: string; icon: typeof FileJson }> = {
-  raw: {
-    label: "Raw export",
-    short: "Raw",
-    description: "Single full_export.json — every field exactly as fetched, no chunking, no extras.",
-    icon: FileJson,
-  },
-  ai: {
-    label: "AI-optimized export",
-    short: "AI-ready",
-    description: "ai_ingestion.jsonl — one JSON object per line, content + summary fields ready for ChatGPT / RAG ingestion.",
-    icon: Sparkles,
-  },
-  full: {
-    label: "Full export with attachments",
-    short: "Full bundle",
-    description: "Everything: full_export.json, ai_ingestion.jsonl, export_manifest.json, attachments_index.json, processing_log.json.",
-    icon: FileArchive,
-  },
-};
-
-function downloadBlob(content: string, filename: string, mimeType: string) {
-  const blob = new Blob([content], { type: mimeType });
+function triggerBlobDownload(blob: Blob, filename: string) {
   const url = window.URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
   document.body.appendChild(a);
   a.click();
-  window.URL.revokeObjectURL(url);
   document.body.removeChild(a);
+  // Revoke after a tick so Safari/Firefox finish the download
+  setTimeout(() => window.URL.revokeObjectURL(url), 1500);
 }
 
-interface SummaryStats {
-  emailsExported: number;
-  emailsWithAttachments: number;
-  totalAttachments: number;
-  extractedSuccess: number;
-  failed: number;
-  unsupported: number;
-  filesDownloaded: string[];
-  modeUsed: ExportMode;
-  exportId: string;
+function parseFilenameFromContentDisposition(value: string | null): string | null {
+  if (!value) return null;
+  const m = /filename\s*=\s*"?([^";]+)"?/i.exec(value);
+  return m ? m[1] : null;
 }
 
 export function ExportToolbar({
@@ -108,147 +96,115 @@ export function ExportToolbar({
   onClearSelection,
   onExportComplete,
 }: ExportToolbarProps) {
-  const exportEmails = useExportEmails();
   const { toast } = useToast();
   const queryClient = useQueryClient();
+  const [isPending, setIsPending] = useState(false);
   const [lastExportId, setLastExportId] = useState<string | null>(null);
-  const [mode, setMode] = useState<ExportMode>("full");
   const [summary, setSummary] = useState<SummaryStats | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
 
-  const handleExport = () => {
-    if (selectedMessageIds.length === 0) return;
-
-    exportEmails.mutate(
-      {
-        data: {
+  const handleExport = async () => {
+    if (selectedMessageIds.length === 0 || isPending) return;
+    setIsPending(true);
+    try {
+      const response = await fetch("/api/gmail/export", {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/zip",
+        },
+        body: JSON.stringify({
           messageIds: selectedMessageIds,
           queryUsed,
           chunkLargeBodies: false,
           ...(searchFilters ? { searchFilters } : {}),
-        },
-      },
-      {
-        onSuccess: (response) => {
-          queryClient.invalidateQueries({ queryKey: getGetExportLogsQueryKey() });
-          setLastExportId(response.exportId);
+        }),
+      });
 
-          const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          const baseFilename = `gmail-export-${timestamp}`;
-          const filesDownloaded: string[] = [];
-
-          try {
-            const manifest = response.manifest as ExportResult["manifest"] | null;
-            const records: Array<Record<string, unknown>> = Array.isArray(response.fullExport)
-              ? (response.fullExport as Array<Record<string, unknown>>)
-              : [];
-
-            // Guarantee attachments is always an array on every record (defensive client-side)
-            for (const r of records) {
-              if (!Array.isArray((r as { attachments?: unknown }).attachments)) {
-                (r as { attachments: unknown[] }).attachments = [];
-              }
-              const meta = (r as { metadata?: Record<string, unknown> }).metadata;
-              if (meta && typeof (meta as { has_attachments?: unknown }).has_attachments !== "boolean") {
-                (meta as { has_attachments: boolean }).has_attachments =
-                  ((r as { attachments: unknown[] }).attachments).length > 0;
-              }
-              if (meta && typeof (meta as { attachment_count?: unknown }).attachment_count !== "number") {
-                (meta as { attachment_count: number }).attachment_count =
-                  ((r as { attachments: unknown[] }).attachments).length;
-              }
-            }
-
-            const attachmentsIndex = (response as { attachmentsIndex?: unknown[] }).attachmentsIndex;
-            const processingLog = (response as { processingLog?: unknown[] }).processingLog;
-            const aiIngestion = response.aiIngestion;
-
-            // Decide which files to write based on selected mode
-            if (mode === "raw" || mode === "full") {
-              downloadBlob(
-                JSON.stringify(response.fullExport, null, 2),
-                `${baseFilename}_full_export.json`,
-                "application/json",
-              );
-              filesDownloaded.push(`${baseFilename}_full_export.json`);
-            }
-
-            if ((mode === "ai" || mode === "full") && aiIngestion) {
-              downloadBlob(
-                typeof aiIngestion === "string" ? aiIngestion : JSON.stringify(aiIngestion),
-                `${baseFilename}_ai_ingestion.jsonl`,
-                "application/x-ndjson",
-              );
-              filesDownloaded.push(`${baseFilename}_ai_ingestion.jsonl`);
-            }
-
-            if (mode === "full") {
-              downloadBlob(
-                JSON.stringify(response.manifest, null, 2),
-                `${baseFilename}_export_manifest.json`,
-                "application/json",
-              );
-              filesDownloaded.push(`${baseFilename}_export_manifest.json`);
-
-              if (Array.isArray(attachmentsIndex)) {
-                downloadBlob(
-                  JSON.stringify(attachmentsIndex, null, 2),
-                  `${baseFilename}_attachments_index.json`,
-                  "application/json",
-                );
-                filesDownloaded.push(`${baseFilename}_attachments_index.json`);
-              }
-              if (Array.isArray(processingLog) && processingLog.length > 0) {
-                downloadBlob(
-                  JSON.stringify(processingLog, null, 2),
-                  `${baseFilename}_processing_log.json`,
-                  "application/json",
-                );
-                filesDownloaded.push(`${baseFilename}_processing_log.json`);
-              }
-            }
-
-            // Build user-facing summary
-            const emailsExported = response.count ?? records.length;
-            const emailsWithAttachments = records.filter((r) => {
-              const atts = (r as { attachments?: unknown[] }).attachments;
-              return Array.isArray(atts) && atts.length > 0;
-            }).length;
-
-            const stats: SummaryStats = {
-              emailsExported,
-              emailsWithAttachments,
-              totalAttachments: manifest?.attachment_count_total ?? 0,
-              extractedSuccess: manifest?.attachment_extracted_success_count ?? 0,
-              failed: manifest?.attachment_failure_count ?? 0,
-              unsupported: manifest?.attachment_unsupported_count ?? 0,
-              filesDownloaded,
-              modeUsed: mode,
-              exportId: response.exportId,
-            };
-            setSummary(stats);
-            setSummaryOpen(true);
-
-            toast({
-              description: `Exported ${emailsExported} email${emailsExported === 1 ? "" : "s"} (${EXPORT_MODES[mode].short}). ${filesDownloaded.length} file${filesDownloaded.length === 1 ? "" : "s"} downloaded.`,
-            });
-
-            if (onExportComplete && manifest) {
-              onExportComplete({ manifest });
-            }
-          } catch (err) {
-            console.error("Failed to trigger download:", err);
-            toast({ variant: "destructive", description: "Export completed but download failed." });
+      if (!response.ok) {
+        let errMsg = `Export failed (${response.status})`;
+        try {
+          const body = await response.json();
+          if (body && typeof body === "object" && "error" in body) {
+            errMsg = String((body as { error: unknown }).error);
           }
-        },
-        onError: (err) => {
-          toast({ variant: "destructive", description: "Export failed: " + ((err as { error?: string }).error || "Unknown error") });
-        },
-      },
-    );
-  };
+        } catch {
+          /* response body not JSON */
+        }
+        throw new Error(errMsg);
+      }
 
-  const ModeIcon = EXPORT_MODES[mode].icon;
+      const blob = await response.blob();
+      const cd = response.headers.get("Content-Disposition");
+      const filename =
+        parseFilenameFromContentDisposition(cd) ??
+        `gmail-export-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.zip`;
+
+      triggerBlobDownload(blob, filename);
+
+      const exportId = response.headers.get("X-Export-Id") ?? "";
+      const stats: SummaryStats = {
+        exportId,
+        emailsExported: Number(response.headers.get("X-Export-Email-Count") ?? 0),
+        totalAttachments: Number(
+          response.headers.get("X-Export-Attachment-Count") ?? 0,
+        ),
+        extractedSuccess: Number(
+          response.headers.get("X-Export-Attachment-Success") ?? 0,
+        ),
+        failed: Number(response.headers.get("X-Export-Attachment-Failed") ?? 0),
+        unsupported: Number(
+          response.headers.get("X-Export-Attachment-Unsupported") ?? 0,
+        ),
+        zipFilename: filename,
+        zipSizeBytes: blob.size,
+        validationStatus:
+          response.headers.get("X-Export-Validation") ?? "unknown",
+      };
+      setLastExportId(exportId);
+      setSummary(stats);
+      setSummaryOpen(true);
+      queryClient.invalidateQueries({ queryKey: getGetExportLogsQueryKey() });
+
+      toast({
+        description: `Exported ${stats.emailsExported} email${
+          stats.emailsExported === 1 ? "" : "s"
+        } as ${filename}`,
+      });
+
+      if (onExportComplete) {
+        // Note: the backend no longer returns the manifest in the response body
+        // (the ZIP is the body), so we synthesise a minimal manifest from headers
+        // for downstream consumers.
+        onExportComplete({
+          manifest: {
+            export_id: stats.exportId,
+            exported_at: new Date().toISOString(),
+            email_count: stats.emailsExported,
+            attachment_count_total: stats.totalAttachments,
+            attachment_extracted_success_count: stats.extractedSuccess,
+            attachment_failure_count: stats.failed,
+            attachment_unsupported_count: stats.unsupported,
+            attachment_skipped_count: 0,
+            email_body_failure_count: 0,
+            failure_breakdown: {},
+            emails_with_any_errors: [],
+            attachments_requiring_user_action: [],
+          },
+        });
+      }
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        description:
+          "Export failed: " +
+          (err instanceof Error ? err.message : String(err)),
+      });
+    } finally {
+      setIsPending(false);
+    }
+  };
 
   if (selectedCount === 0) {
     return (
@@ -278,7 +234,7 @@ export function ExportToolbar({
         </div>
 
         <div className="flex items-center gap-2">
-          {lastExportId && !exportEmails.isPending && (
+          {lastExportId && !isPending && (
             <button
               type="button"
               onClick={() => summary && setSummaryOpen(true)}
@@ -286,50 +242,22 @@ export function ExportToolbar({
               data-testid="button-show-summary"
             >
               <CheckCircle2 className="h-3.5 w-3.5" />
-              <span>Bundle downloaded — view summary</span>
+              <span>ZIP downloaded — view summary</span>
             </button>
           )}
 
-          <Select value={mode} onValueChange={(v) => setMode(v as ExportMode)}>
-            <SelectTrigger className="h-9 w-[230px]" data-testid="select-export-mode">
-              <div className="flex items-center gap-2 truncate">
-                <ModeIcon className="h-3.5 w-3.5 shrink-0" />
-                <SelectValue />
-              </div>
-            </SelectTrigger>
-            <SelectContent>
-              {(Object.keys(EXPORT_MODES) as ExportMode[]).map((k) => {
-                const m = EXPORT_MODES[k];
-                const Icon = m.icon;
-                return (
-                  <SelectItem key={k} value={k} data-testid={`option-mode-${k}`}>
-                    <div className="flex items-start gap-2 py-0.5">
-                      <Icon className="h-4 w-4 mt-0.5 shrink-0" />
-                      <div className="flex flex-col">
-                        <span className="font-medium text-sm">{m.label}</span>
-                        <span className="text-[11px] text-muted-foreground leading-tight max-w-[260px]">
-                          {m.description}
-                        </span>
-                      </div>
-                    </div>
-                  </SelectItem>
-                );
-              })}
-            </SelectContent>
-          </Select>
-
           <Button
             onClick={handleExport}
-            disabled={exportEmails.isPending}
+            disabled={isPending}
             className="h-9"
             data-testid="button-execute-export"
           >
-            {exportEmails.isPending ? (
+            {isPending ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             ) : (
               <Download className="mr-2 h-4 w-4" />
             )}
-            {exportEmails.isPending ? "Exporting…" : `Export (${EXPORT_MODES[mode].short})`}
+            {isPending ? "Building ZIP…" : "Export ZIP"}
           </Button>
         </div>
       </div>
@@ -343,7 +271,10 @@ export function ExportToolbar({
             </DialogTitle>
             <DialogDescription>
               {summary && (
-                <>Mode: <span className="font-medium">{EXPORT_MODES[summary.modeUsed].label}</span> · ID: <code className="text-[11px]">{summary.exportId}</code></>
+                <>
+                  File: <code className="text-[11px]">{summary.zipFilename}</code> · ID:{" "}
+                  <code className="text-[11px]">{summary.exportId}</code>
+                </>
               )}
             </DialogDescription>
           </DialogHeader>
@@ -351,40 +282,89 @@ export function ExportToolbar({
           {summary && (
             <div className="space-y-4 text-sm">
               <div className="grid grid-cols-2 gap-2">
-                <SummaryStat icon={<Mail className="h-4 w-4" />} label="Emails exported" value={summary.emailsExported} />
-                <SummaryStat icon={<Paperclip className="h-4 w-4" />} label="Emails with attachments" value={summary.emailsWithAttachments} />
-                <SummaryStat icon={<FileArchive className="h-4 w-4" />} label="Total attachments" value={summary.totalAttachments} />
-                <SummaryStat icon={<CheckCircle2 className="h-4 w-4 text-emerald-500" />} label="Extracted successfully" value={summary.extractedSuccess} tone="success" />
-                <SummaryStat icon={<AlertTriangle className="h-4 w-4 text-destructive" />} label="Failed" value={summary.failed} tone={summary.failed > 0 ? "error" : "muted"} />
-                <SummaryStat icon={<FileQuestion className="h-4 w-4 text-amber-500" />} label="Unsupported" value={summary.unsupported} tone={summary.unsupported > 0 ? "warn" : "muted"} />
+                <SummaryStat
+                  icon={<Mail className="h-4 w-4" />}
+                  label="Emails exported"
+                  value={summary.emailsExported}
+                />
+                <SummaryStat
+                  icon={<Paperclip className="h-4 w-4" />}
+                  label="Total attachments"
+                  value={summary.totalAttachments}
+                />
+                <SummaryStat
+                  icon={
+                    <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                  }
+                  label="Extracted successfully"
+                  value={summary.extractedSuccess}
+                  tone="success"
+                />
+                <SummaryStat
+                  icon={
+                    <AlertTriangle className="h-4 w-4 text-destructive" />
+                  }
+                  label="Failed"
+                  value={summary.failed}
+                  tone={summary.failed > 0 ? "error" : "muted"}
+                />
+                <SummaryStat
+                  icon={
+                    <FileQuestion className="h-4 w-4 text-amber-500" />
+                  }
+                  label="Unsupported"
+                  value={summary.unsupported}
+                  tone={summary.unsupported > 0 ? "warn" : "muted"}
+                />
+                <SummaryStat
+                  icon={<FileArchive className="h-4 w-4" />}
+                  label="ZIP size"
+                  value={Math.round(summary.zipSizeBytes / 1024)}
+                  unit="KB"
+                />
               </div>
 
-              <div>
-                <div className="text-xs font-medium text-muted-foreground mb-1.5">Files downloaded ({summary.filesDownloaded.length})</div>
-                <ul className="space-y-1 text-xs font-mono bg-muted/40 rounded p-2 max-h-32 overflow-auto">
-                  {summary.filesDownloaded.map((f) => (
-                    <li key={f} className="flex items-center gap-1.5">
-                      <FileJson className="h-3 w-3 shrink-0 text-muted-foreground" />
-                      {f}
-                    </li>
-                  ))}
-                </ul>
+              <div className="rounded border bg-muted/40 p-2 text-xs flex items-start gap-2">
+                {summary.validationStatus === "ok" ? (
+                  <ShieldCheck className="h-4 w-4 mt-0.5 text-emerald-500 shrink-0" />
+                ) : (
+                  <ShieldAlert className="h-4 w-4 mt-0.5 text-amber-500 shrink-0" />
+                )}
+                <div>
+                  <div className="font-medium">
+                    Validation: {summary.validationStatus}
+                  </div>
+                  <div className="text-muted-foreground mt-0.5">
+                    The ZIP contains <code>full_export.json</code>,{" "}
+                    <code>ai_ingestion.jsonl</code>,{" "}
+                    <code>attachments_index.json</code>,{" "}
+                    <code>export_manifest.json</code>,{" "}
+                    <code>processing_log.json</code> plus all downloaded
+                    attachments under <code>attachments/</code>.
+                  </div>
+                </div>
               </div>
 
               {summary.failed === 0 && summary.unsupported === 0 ? (
                 <div className="text-xs text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded p-2">
-                  All attachments processed cleanly. Exported records include <code>metadata.has_attachments</code>, <code>metadata.attachment_count</code>, and an <code>attachments[]</code> array (empty when none).
+                  All attachments processed cleanly.
                 </div>
               ) : (
                 <div className="text-xs text-amber-700 dark:text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded p-2">
-                  Some attachments need attention. Open the Problems panel below the table for per-file actions, or inspect <code>processing_log.json</code> for the full audit trail.
+                  Some attachments need attention. Open{" "}
+                  <code>processing_log.json</code> in the ZIP for the full
+                  audit trail.
                 </div>
               )}
             </div>
           )}
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setSummaryOpen(false)} data-testid="button-close-summary">
+            <Button
+              variant="outline"
+              onClick={() => setSummaryOpen(false)}
+              data-testid="button-close-summary"
+            >
               Close
             </Button>
           </DialogFooter>
@@ -398,30 +378,35 @@ function SummaryStat({
   icon,
   label,
   value,
+  unit,
   tone = "neutral",
 }: {
   icon: React.ReactNode;
   label: string;
   value: number;
+  unit?: string;
   tone?: "neutral" | "success" | "error" | "warn" | "muted";
 }) {
   const toneClass =
     tone === "success"
       ? "text-emerald-700 dark:text-emerald-400"
       : tone === "error"
-      ? "text-destructive"
-      : tone === "warn"
-      ? "text-amber-700 dark:text-amber-400"
-      : tone === "muted"
-      ? "text-muted-foreground"
-      : "text-foreground";
+        ? "text-destructive"
+        : tone === "warn"
+          ? "text-amber-700 dark:text-amber-400"
+          : tone === "muted"
+            ? "text-muted-foreground"
+            : "text-foreground";
   return (
     <div className="border rounded-md p-2.5 bg-card">
       <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
         {icon}
         {label}
       </div>
-      <div className={`text-xl font-semibold mt-0.5 ${toneClass}`}>{value}</div>
+      <div className={`text-xl font-semibold mt-0.5 ${toneClass}`}>
+        {value}
+        {unit ? <span className="text-xs font-normal ml-1">{unit}</span> : null}
+      </div>
     </div>
   );
 }

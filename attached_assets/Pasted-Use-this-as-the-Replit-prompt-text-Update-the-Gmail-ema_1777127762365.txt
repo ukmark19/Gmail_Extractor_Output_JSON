@@ -1,0 +1,278 @@
+Use this as the Replit prompt:
+
+```text
+Update the Gmail/email export tool so it produces a complete, single downloadable export package suitable for downstream ingestion.
+
+Context:
+This system must fully process the selected emails and their attachments into output files for a separate ingestion/chunking pipeline. The other program handles downstream processing, but this exporter must deliver complete, reliable, auditable email + attachment data.
+
+Current issue:
+The exporter currently produces five separate JSON files requiring manual download:
+- ai_ingestion.jsonl
+- attachments_index.json
+- export_manifest.json
+- full_export.json
+- processing_log.json
+
+I want one output file instead, preferably:
+- gmail-export-<timestamp>.zip
+
+The ZIP should contain the same JSON files, plus any downloaded attachment files if applicable.
+
+Required output structure inside ZIP:
+
+gmail-export-<timestamp>/
+  ai_ingestion.jsonl
+  full_export.json
+  attachments_index.json
+  export_manifest.json
+  processing_log.json
+  attachments/
+    <message_id>/
+      <unique_attachment_filename>
+
+Critical requirements:
+
+1. Produce one ZIP file
+- At the end of export, create one downloadable ZIP.
+- Keep the individual JSON files inside the ZIP.
+- Do not require five manual downloads.
+- The ZIP filename should include timestamp and export_id.
+
+2. Attachment completeness
+Every detected attachment must be represented in:
+- full_export.json
+- attachments_index.json
+- processing_log.json
+
+Every attachment record must include:
+- attachment_id
+- parent message_id
+- parent document_id
+- filename
+- safe_filename
+- unique storage_path
+- content_type / mime_type
+- extension
+- size_bytes
+- sha256
+- was_downloaded
+- extraction_status
+- extraction_method
+- text_extracted
+- page_count where applicable
+- failure_category if failed
+- failure_detail if failed
+- user_action_needed if applicable
+
+3. Download and hash all attachments
+Download every attachment, including unsupported files.
+Unsupported should mean “not text extracted”, not “not downloaded”.
+
+Required:
+- sha256 must not be null if the attachment was retrievable.
+- storage_path must point to the downloaded file inside the ZIP.
+- If download fails, record network_fetch_error or appropriate failure category.
+
+4. Unique attachment filenames
+Avoid collisions such as repeated image001.png.
+
+Use a deterministic naming pattern:
+<part_id>_<sha256_prefix>_<safe_filename>
+
+Example:
+attachments/19d971b2d4001fc0/001_a1b2c3d4_image001.png
+
+Do not overwrite attachments with identical filenames.
+
+5. Correct manifest counts
+Fix the manifest counting bug.
+
+Current wrong behaviour:
+attachment_unsupported_count was reported as 82 despite failure_breakdown.unsupported_file_type being 41.
+
+Required logic:
+attachment_count_total = all detected attachments
+attachment_supported_count = attachments with supported extraction type
+attachment_unsupported_count = unsupported file types only
+attachment_extracted_success_count = supported attachments successfully text extracted
+attachment_failure_count = supported attachments that failed extraction
+attachment_skipped_count = deliberately skipped attachments
+
+Validation:
+attachment_supported_count + attachment_unsupported_count should equal attachment_count_total unless download failures prevent classification.
+attachment_extracted_success_count + attachment_failure_count + attachment_partial_count should equal attachment_supported_count, subject only to explicitly skipped items.
+
+6. PDF security removal
+Before parsing PDFs, attempt automatic security removal.
+
+Preferred:
+- use qpdf --decrypt where available
+- retain original file hash
+- create processed/unlocked file hash
+
+Attachment metadata should include:
+- original_sha256
+- processed_sha256
+- security_removed: true/false
+- security_removal_method: "qpdf" | "none" | "failed"
+- security_removal_error if failed
+
+If PDF remains password protected:
+- extraction_status: failed
+- failure_category: encrypted_or_password_protected
+- user_action_needed: password required or manual unlock required
+
+7. PDF page numbering
+For PDFs, output page-level extraction metadata.
+
+Add to each PDF attachment:
+pages: [
+  {
+    page_number: 1,
+    text: "...",
+    text_extracted: true,
+    extraction_method: "pdf_text" | "ocr" | "none",
+    error: null
+  }
+]
+
+Also include:
+- page_count
+- pages_extracted_count
+- pages_failed_count
+
+If full extracted_text is retained, it should be built from page text with clear page markers:
+
+--- Page 1 ---
+text
+
+--- Page 2 ---
+text
+
+8. OCR dependency handling
+The exporter currently failed OCR with:
+spawn pdftoppm ENOENT
+
+This should be handled clearly.
+
+Required:
+- check at startup whether pdftoppm/poppler is available
+- check whether tesseract is available if OCR is enabled
+- if missing, record environment_error with exact missing dependency
+- do not describe this as a document failure
+
+If OCR is unavailable:
+- OCR-required documents should fail with:
+  failure_category: ocr_unavailable
+  user_action_needed: install poppler-utils / tesseract or run OCR externally
+
+9. Image handling
+Images should be downloaded and hashed.
+
+Do not OCR every image by default unless OCR is configured.
+
+Classify images:
+- inline_signature
+- embedded_logo
+- substantive_attachment
+- unknown_image
+
+Likely signature/logo images should not pollute AI ingestion text.
+
+Image metadata should include:
+- dimensions if available
+- is_inline
+- content_id
+- attachment_role
+- text_extracted: false unless OCR succeeds
+
+10. Attached EML handling
+If an email contains .eml attachments:
+- download and hash them
+- parse them recursively where possible
+- include child emails as child records
+- preserve parent_message_id and attachment_id linkage
+
+If parsing fails:
+- failure_category: parser_error
+- user_action_needed if applicable
+
+11. AI ingestion file
+The ai_ingestion.jsonl must include all text actually available for downstream processing:
+- email body
+- extracted attachment text
+- attachment metadata
+- page markers for PDFs
+- clear source references
+
+Each JSONL record should include:
+- document_id
+- record_type
+- source
+- subject
+- from
+- to
+- date
+- thread_id
+- message_id
+- content
+- attachments_summary
+- attachment_text_blocks
+- errors
+- warnings
+- metadata
+
+12. Processing log
+processing_log.json must include:
+- email fetch started/completed
+- attachment detected
+- attachment download started/completed/failed
+- hash generated
+- security removal attempted/completed/failed
+- extraction attempted/completed/failed
+- OCR attempted/completed/failed
+- ZIP generation started/completed
+
+13. Validation before ZIP
+Before creating the ZIP, run a validation step and include validation results in export_manifest.json.
+
+Validation should check:
+- every attachment in full_export exists in attachments_index
+- every downloaded attachment has sha256
+- every storage_path is unique
+- no duplicate filename collision under same message_id
+- manifest counts reconcile
+- every failed extraction has failure_category
+- every failed extraction has user_action_needed where appropriate
+- every PDF has page_count or a clear reason why not
+- every PDF with extracted text has page-level page records
+
+If validation fails:
+- still create ZIP
+- but mark export_manifest.validation_status = "warnings" or "failed"
+- include validation_errors and validation_warnings
+
+14. Final console output
+At the end, print only the important summary:
+- ZIP path
+- email count
+- attachment count
+- extracted success count
+- failure count
+- unsupported count
+- validation status
+
+Do not require manual collection of five separate files.
+
+Acceptance criteria:
+- One ZIP file is produced.
+- ZIP contains the five JSON files and downloaded attachments.
+- All attachments are either downloaded and hashed or have a clear download failure.
+- Manifest counts reconcile correctly.
+- Unsupported files are not counted as all attachments.
+- PDFs have page_count and page-level text where extraction succeeds.
+- Encrypted PDFs are attempted through qpdf before failure.
+- OCR dependency errors are explicit and not treated as document corruption.
+- The output is ready for the downstream ingestion system without manual cleanup.
+```
