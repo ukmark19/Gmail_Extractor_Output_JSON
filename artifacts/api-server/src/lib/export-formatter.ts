@@ -570,28 +570,39 @@ export function buildDetailedManifest(
 
     attachmentTotal += attachments.length;
     for (const att of attachments) {
-      // Single source of truth: is_supported decides supported vs unsupported buckets.
-      if (att.is_supported) attachmentSupported++;
-      else attachmentUnsupported++;
       if (att.duplicate_of) duplicateCount++;
 
-      // Status buckets are independent of supported/unsupported (no double-counting).
+      // Status buckets ARE the source of truth and partition `total`
+      // exactly. Previously we had a parallel `is_supported` flag deciding
+      // supported vs unsupported, which let an attachment be counted as
+      // both `unsupported` and `success` (e.g. inline parts marked
+      // is_supported=false but extracted via the plain-text branch). That
+      // caused the impossible manifest math the user reported
+      // (success=102 > supported=92). Derive supported/unsupported from
+      // extraction_status only.
       switch (att.extraction_status) {
         case "success":
           attachmentSuccess++;
+          attachmentSupported++;
           break;
         case "partial":
           attachmentPartial++;
+          attachmentSupported++;
           break;
         case "failed":
           attachmentFailed++;
+          attachmentSupported++;
           emailHasError = true;
           break;
         case "skipped":
           attachmentSkipped++;
+          // A skipped item is "of a supported type but we deliberately
+          // didn't process it" (e.g. too large) — treat as supported so
+          // unsupported_count truly means "MIME type not in pipeline".
+          attachmentSupported++;
           break;
         case "unsupported":
-          // already counted in attachmentUnsupported via is_supported=false
+          attachmentUnsupported++;
           break;
       }
 
@@ -854,9 +865,18 @@ export interface ErrorsReportEntry {
   attachment_id: string;
   filename: string;
   mime_type: string;
+  // Two name pairs are intentionally kept here:
+  //   - `category` / `detail` are the long-standing field names already
+  //     consumed by clients of the errors_report.json file.
+  //   - `failure_category` / `failure_detail` are the explicit names called
+  //     out in the spec and match the field names used inside the manifest
+  //     and attachments_index for consistency. Emitting both keeps the
+  //     report easy to grep without breaking older readers.
   category: string;
+  failure_category: string;
   status: ExtractionStatusLabel;
   detail: string | null;
+  failure_detail: string | null;
   user_action_needed: string | null;
   storage_path: string;
 }
@@ -885,14 +905,17 @@ export function buildErrorsReport(
           : att.extraction_status === "skipped"
             ? "skipped"
             : "unknown_error");
+      const detail = att.failure_detail ?? att.skip_reason ?? null;
       const entry: ErrorsReportEntry = {
         message_id: email.id,
         attachment_id: att.attachment_id,
         filename: att.filename,
         mime_type: att.mime_type,
         category,
+        failure_category: category,
         status: att.extraction_status,
-        detail: att.failure_detail ?? att.skip_reason ?? null,
+        detail,
+        failure_detail: detail,
         user_action_needed: att.user_action_needed,
         storage_path: att.storage_path,
       };
@@ -1070,24 +1093,38 @@ export function validateExportBundle(
     }
   }
 
-  // 5. manifest counts reconcile
+  // 5. manifest counts reconcile (HARD invariant — promote to error so the
+  // ZIP is marked validation_failed if the math doesn't add up).
   if (
     manifest.attachment_supported_count + manifest.attachment_unsupported_count !==
     manifest.attachment_count_total
   ) {
-    warnings.push(
+    errors.push(
       `manifest: supported(${manifest.attachment_supported_count}) + unsupported(${manifest.attachment_unsupported_count}) != total(${manifest.attachment_count_total})`,
     );
   }
-  const statusSum =
+  // Required reconciliation per spec: success + partial + failed + skipped +
+  // unsupported MUST equal total. Anything else means we lost track of an
+  // attachment somewhere in the pipeline and the manifest is misleading.
+  const reconciliationSum =
     manifest.attachment_extracted_success_count +
     manifest.attachment_partial_count +
     manifest.attachment_failure_count +
-    manifest.attachment_skipped_count;
-  // The status sum should be ≤ total (unsupported has its own status that may not appear in any of the above)
-  if (statusSum > manifest.attachment_count_total) {
-    warnings.push(
-      `manifest: status counts (${statusSum}) exceed total (${manifest.attachment_count_total})`,
+    manifest.attachment_skipped_count +
+    manifest.attachment_unsupported_count;
+  if (reconciliationSum !== manifest.attachment_count_total) {
+    errors.push(
+      `manifest: status reconciliation failed — success(${manifest.attachment_extracted_success_count}) + partial(${manifest.attachment_partial_count}) + failed(${manifest.attachment_failure_count}) + skipped(${manifest.attachment_skipped_count}) + unsupported(${manifest.attachment_unsupported_count}) = ${reconciliationSum} != total(${manifest.attachment_count_total})`,
+    );
+  }
+  // Implied invariant: success_count must not exceed supported_count (the
+  // exact bug the user observed: 102 > 92).
+  if (
+    manifest.attachment_extracted_success_count >
+    manifest.attachment_supported_count
+  ) {
+    errors.push(
+      `manifest: success(${manifest.attachment_extracted_success_count}) exceeds supported(${manifest.attachment_supported_count}) — supported/unsupported buckets are inconsistent with extraction_status`,
     );
   }
 
@@ -1237,20 +1274,32 @@ function computeManifestCountsOnly(
   for (const { attachments } of emails) {
     total += attachments.length;
     for (const a of attachments) {
-      if (a.is_supported) supported++;
-      else unsupported++;
+      // Mirror the partition used by buildDetailedManifest: derive
+      // supported/unsupported strictly from extraction_status so that the
+      // validation pass and the manifest agree by construction.
+      // The legacy `is_supported` flag remains on the per-attachment
+      // record for diagnostic use only and is intentionally NOT consulted
+      // here — using both produced the impossible "success > supported"
+      // case (e.g. images returning success but is_supported=false).
       switch (a.extraction_status) {
         case "success":
           success++;
+          supported++;
           break;
         case "partial":
           partial++;
+          supported++;
           break;
         case "failed":
           failed++;
+          supported++;
           break;
         case "skipped":
           skipped++;
+          supported++;
+          break;
+        case "unsupported":
+          unsupported++;
           break;
       }
     }

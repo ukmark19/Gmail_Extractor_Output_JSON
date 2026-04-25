@@ -12,7 +12,7 @@ import {
   convertPdfToImages,
   type PdfSecurityAnalysis,
 } from "../services/pdfSecurityService";
-import { getDependencyReport } from "../services/dependencyCheck";
+import { ensureDependencyReport } from "../services/dependencyCheck";
 
 const OCR_MAX_PAGES = 20;
 const OCR_TRIGGER_CHAR_THRESHOLD = 50;
@@ -125,7 +125,9 @@ async function extractPdfPages(
   if (!pageCount || pageCount <= 0) {
     return { pages: [], method: "pdftotext", error: "page count unknown" };
   }
-  const deps = getDependencyReport();
+  // Use ensureDependencyReport so we don't misreport binaries as missing
+  // when this runs before the startup probe has cached its result.
+  const deps = await ensureDependencyReport();
   // Prefer pdftotext per-page when available
   if (deps?.pdftotext.available) {
     const tmp = await mkdtemp(join(tmpdir(), "pdf-pages-"));
@@ -207,7 +209,9 @@ async function ocrPdfPages(
   error: string | null;
   pageImages: Array<{ pageNumber: number; png: Buffer }>;
 }> {
-  const deps = getDependencyReport();
+  // Always await — `getDependencyReport()` returns null until the startup
+  // probe completes, which would falsely surface as "pdftoppm missing".
+  const deps = await ensureDependencyReport();
   if (!deps?.pdftoppm.available) {
     return {
       pages: [],
@@ -349,6 +353,14 @@ export type FailureCategory =
   | "environment_error"
   | "network_fetch_error"
   | "permission_error"
+  // High-level export-flow categories used by the export route's
+  // processing_log for situations that aren't tied to a specific
+  // attachment (no selection, no Gmail results, every per-message fetch
+  // failed, manifest reconciliation failed).
+  | "no_selection"
+  | "no_results"
+  | "all_fetches_failed"
+  | "manifest_reconciliation"
   | "unknown_error";
 
 export type ExtractionStatus =
@@ -519,6 +531,110 @@ const IMAGE_MIME_TYPES = new Set([
 function getFileExtension(filename: string): string {
   const dotIdx = filename.lastIndexOf(".");
   return dotIdx >= 0 ? filename.slice(dotIdx + 1).toLowerCase() : "";
+}
+
+/**
+ * MIME → preferred file extension. Used when Gmail's part has no filename
+ * (or just "unnamed") so we can produce a usable, recognisable file in the
+ * extracted_attachments/ folder rather than a string of `unnamed` blobs.
+ *
+ * Only the canonical extension per MIME is listed — consumers like editors
+ * and OS file pickers rely on a deterministic extension, so leave aliases
+ * (e.g. .htm) alone and prefer the dominant one (.html).
+ */
+const MIME_TO_EXT: Record<string, string> = {
+  "text/plain": "txt",
+  "text/csv": "csv",
+  "text/html": "html",
+  "text/xml": "xml",
+  "text/calendar": "ics",
+  "application/json": "json",
+  "application/xml": "xml",
+  "application/pdf": "pdf",
+  "application/zip": "zip",
+  "application/rtf": "rtf",
+  "application/x-rtf": "rtf",
+  "application/msword": "doc",
+  "application/vnd.ms-excel": "xls",
+  "application/vnd.ms-powerpoint": "ppt",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+    "docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation":
+    "pptx",
+  "application/vnd.oasis.opendocument.text": "odt",
+  "application/vnd.oasis.opendocument.spreadsheet": "ods",
+  "message/rfc822": "eml",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/gif": "gif",
+  "image/bmp": "bmp",
+  "image/tiff": "tiff",
+  "image/webp": "webp",
+  "image/svg+xml": "svg",
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+  "audio/ogg": "ogg",
+  "video/mp4": "mp4",
+  "video/quicktime": "mov",
+  "video/webm": "webm",
+};
+
+function extensionForMime(mimeType: string): string {
+  const lower = (mimeType || "").toLowerCase().split(";")[0].trim();
+  if (MIME_TO_EXT[lower]) return MIME_TO_EXT[lower];
+  // Generic fallbacks: image/* → png, text/* → txt, audio/* → bin, video/* → bin
+  if (lower.startsWith("image/")) return lower.split("/")[1] || "bin";
+  if (lower.startsWith("text/")) return "txt";
+  if (lower.startsWith("audio/")) return "bin";
+  if (lower.startsWith("video/")) return "bin";
+  return "bin";
+}
+
+/**
+ * Derive a usable filename when Gmail gave us nothing, an empty string, or
+ * "unnamed". Returns either the original (trusted) filename or a
+ * MIME-inferred fallback like `unnamed_part_3.pdf`.
+ *
+ * Distinguishing inline body parts (e.g. text/html signatures) from real
+ * attachments is the caller's job via `attachment_role` — this function
+ * just guarantees a sensible filename and a non-empty extension whenever
+ * the MIME type allows inference.
+ */
+function deriveFilename(opts: {
+  rawFilename: string | null | undefined;
+  mimeType: string;
+  partId: string;
+  contentId: string;
+}): { filename: string; fileExtension: string; wasDerived: boolean } {
+  const raw = (opts.rawFilename ?? "").trim();
+  const looksUnnamed = !raw || raw.toLowerCase() === "unnamed";
+  if (!looksUnnamed) {
+    const ext = getFileExtension(raw);
+    // Trusted filename but extension missing — try to add one from MIME.
+    if (!ext) {
+      const inferred = extensionForMime(opts.mimeType);
+      return {
+        filename: `${raw}.${inferred}`,
+        fileExtension: inferred,
+        wasDerived: true,
+      };
+    }
+    return { filename: raw, fileExtension: ext, wasDerived: false };
+  }
+  // No filename at all — synthesise one. Prefer Content-ID (often unique)
+  // then partId; both keep different parts in the same email distinguishable
+  // in the extracted_attachments/ folder.
+  const stem =
+    opts.contentId && opts.contentId.length > 0
+      ? `inline_${opts.contentId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 40)}`
+      : opts.partId
+        ? `unnamed_part_${opts.partId.replace(/[^a-zA-Z0-9._-]/g, "_")}`
+        : "unnamed";
+  const ext = extensionForMime(opts.mimeType);
+  return { filename: `${stem}.${ext}`, fileExtension: ext, wasDerived: true };
 }
 
 function makeLogEntry(
@@ -702,12 +818,10 @@ export async function extractAttachmentContent(
   processingLog: ProcessingLogEntry[],
 ): Promise<ExtractedAttachment> {
   const startTime = Date.now();
-  const filename = part.filename || "unnamed";
   const mimeType = part.mimeType || "application/octet-stream";
   const attachmentId = part.body?.attachmentId || "";
   const sizeBytes = part.body?.size || 0;
   const partId = part.partId || "";
-  const fileExtension = getFileExtension(filename);
   const contentIdHeader = (part.headers || []).find(
     (h) => h.name?.toLowerCase() === "content-id",
   );
@@ -717,6 +831,17 @@ export async function extractAttachmentContent(
       h.name?.toLowerCase() === "content-disposition" &&
       h.value?.includes("inline"),
   );
+  // Derive a sensible filename + extension from MIME when Gmail gave us
+  // nothing (or just the placeholder "unnamed"). This means consumers see
+  // e.g. `inline_logo123.png` instead of an extensionless `unnamed` blob.
+  const derived = deriveFilename({
+    rawFilename: part.filename,
+    mimeType,
+    partId,
+    contentId,
+  });
+  const filename = derived.filename;
+  const fileExtension = derived.fileExtension;
 
   const safeFilename = sanitizeFilename(filename);
   const parentDocumentId = `gmail_${messageId}`;
@@ -1414,7 +1539,10 @@ export async function extractAttachmentContent(
       const pdfMeta = { messageId, attachmentId, filename };
       const warnings: string[] = [];
       const errors: string[] = [];
-      const deps = getDependencyReport();
+      // Always await: see comment on ensureDependencyReport — we don't want
+      // to misreport pdftoppm/qpdf as missing when the startup probe is
+      // still in flight on the very first export.
+      const deps = await ensureDependencyReport();
 
       console.log("[pdf.analyze.started]", pdfMeta);
       const analysis: PdfSecurityAnalysis = await analyzePdfSecurity(attachmentData);

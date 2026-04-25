@@ -86,6 +86,29 @@ export function getDependencyReport(): DependencyReport | null {
   return cachedReport;
 }
 
+// Avoid two callers kicking off duplicate concurrent probes.
+let pendingProbe: Promise<DependencyReport> | null = null;
+
+/**
+ * Always returns a populated DependencyReport. If the startup probe hasn't
+ * finished yet, this awaits it (or runs one) instead of returning null.
+ *
+ * The original `getDependencyReport()` was returning `null` when the
+ * extractor consulted it before the fire-and-forget startup probe in
+ * `index.ts` had resolved. Downstream code does
+ * `if (!deps?.pdftoppm.available)` so a null report is misreported as
+ * "pdftoppm/poppler-utils missing on server" — even when the binaries are
+ * actually installed and working. Use this helper everywhere on hot paths.
+ */
+export async function ensureDependencyReport(): Promise<DependencyReport> {
+  if (cachedReport) return cachedReport;
+  if (pendingProbe) return pendingProbe;
+  pendingProbe = checkDependencies().finally(() => {
+    pendingProbe = null;
+  });
+  return pendingProbe;
+}
+
 export function logDependencyReport(report: DependencyReport): void {
   console.log("[deps.report]", {
     pdftoppm: report.pdftoppm.available

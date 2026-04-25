@@ -726,11 +726,12 @@ router.post(
           { requested: messageIds.length, mode: resolutionMode },
           "[export] every per-message fetch failed; refusing to write empty ZIP",
         );
-        return res.status(502).json({
+        res.status(502).json({
           error:
             "Could not load any of the requested emails from Gmail. Try again, or refine the selection.",
           processingLog,
         });
+        return;
       }
 
       const queryContext: QueryContext = {
@@ -780,6 +781,23 @@ router.post(
           duration_ms: Date.now() - exportStart,
         }),
       );
+      // If the manifest reconciliation produced any errors, emit one
+      // explicit `export_validation_error` event per error so consumers
+      // tailing the processing log see the specific math problem (not just
+      // a "validation_failed" status without context).
+      if (
+        bundle.validation.validation_status === "failed" ||
+        bundle.validation.validation_errors.length > 0
+      ) {
+        for (const verr of bundle.validation.validation_errors) {
+          processingLog.push(
+            makeLog("", null, null, "export_validation_error", "failed", {
+              error_category: "manifest_reconciliation",
+              error_message: verr,
+            }),
+          );
+        }
+      }
       processingLog.push(
         makeLog("", null, null, "export_completed", "success", {
           duration_ms: Date.now() - exportStart,
