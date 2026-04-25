@@ -1,0 +1,139 @@
+INTEGRATE PDF SECURITY REMOVAL MODULE
+
+The application must integrate a PDF security-removal pipeline using pikepdf-based logic derived from an existing utility.
+
+Do NOT build a separate Flask service.
+Convert the functionality into an internal service module.
+
+Create a new module:
+
+services/pdfSecurityService.ts (or .js)
+
+Responsibilities:
+
+1. analyzePdfSecurity(fileBuffer or filePath)
+   - detect:
+     - is_encrypted
+     - requires_password
+     - permissions
+   - return structured metadata
+
+2. attemptPdfUnlock(inputPath, outputPath)
+   - use pikepdf logic equivalent:
+     - open PDF
+     - remove restrictions
+     - save clean copy
+   - return:
+     {
+       success: boolean,
+       output_path: string,
+       error: null | string,
+       failure_category: null | enum
+     }
+
+3. failure classification must include:
+   - encrypted_or_password_protected
+   - corrupt_or_malformed
+   - parser_error
+   - unknown_error
+
+---
+
+PIPELINE INTEGRATION RULE
+
+When processing attachments:
+
+IF file_type == PDF:
+
+STEP 1:
+Attempt normal text extraction
+
+STEP 2:
+IF extraction fails AND PDF is encrypted or restricted:
+    → run attemptPdfUnlock()
+
+STEP 3:
+IF unlock succeeds:
+    → retry extraction using unlocked file
+
+STEP 4:
+IF unlock fails:
+    → classify error
+    → proceed to fallback
+
+STEP 5 (FALLBACK):
+Convert PDF pages to images (JPG or PNG)
+→ extract text using OCR if enabled
+
+STEP 6:
+IF OCR fails or disabled:
+    → still export:
+        - metadata
+        - page images (optional reference)
+        - clear failure message
+
+---
+
+MANDATORY EXPORT LOGGING
+
+Each PDF must include:
+
+{
+  "filename": "...",
+  "is_encrypted": true,
+  "unlock_attempted": true,
+  "unlock_status": "success | failed",
+  "unlock_error": "...",
+  "final_extraction_status": "success | partial | failed",
+  "fallback_used": true,
+  "fallback_method": "pdf_to_images | ocr",
+  "user_action_needed": "...",
+  "errors": []
+}
+
+---
+
+USER ACTION MESSAGES (REQUIRED)
+
+If password protected:
+→ "PDF is password protected. Provide password or remove security manually."
+
+If permission-locked but removable:
+→ "PDF had usage restrictions which were removed successfully."
+
+If corrupt:
+→ "PDF is malformed or corrupted. Re-save or regenerate the file."
+
+---
+
+NO-SILENT-FAIL RULE
+
+Do not:
+- skip PDFs
+- fail extraction without explanation
+- mark extraction as success without text
+
+Every PDF must produce:
+- content OR
+- structured failure output
+
+---
+
+FALLBACK IMAGE CONVERSION
+
+Implement:
+
+convertPdfToImages(pdfPath)
+
+- output: array of image paths
+- preserve page order
+- allow optional OCR step
+
+---
+
+OCR RULE
+
+OCR must be:
+- optional (configurable)
+- clearly labeled as OCR output
+- marked with "low confidence" if needed

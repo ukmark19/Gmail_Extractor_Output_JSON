@@ -6,9 +6,55 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { logger } from "./logger";
 import { decodeBase64 } from "./gmail";
+import {
+  analyzePdfSecurity,
+  attemptPdfUnlock,
+  convertPdfToImages,
+  userActionForUnlock,
+} from "../services/pdfSecurityService";
 
 const OCR_MAX_PAGES = 20;
 const OCR_TRIGGER_CHAR_THRESHOLD = 50;
+const OCR_ENABLED_DEFAULT = true;
+
+function isOcrEnabled(): boolean {
+  const v = process.env.OCR_ENABLED;
+  if (v === undefined || v === "") return OCR_ENABLED_DEFAULT;
+  return v.toLowerCase() === "true" || v === "1";
+}
+
+async function parsePdfBuffer(
+  buffer: Buffer,
+): Promise<{ text: string; numpages: number }> {
+  // Import directly from lib/ to avoid pdf-parse v1's index.js debug-mode
+  // side effect that tries to read a hard-coded test file at startup.
+  const pdfParseModule: unknown = await import("pdf-parse/lib/pdf-parse.js");
+  const moduleCandidate = pdfParseModule as {
+    default?: unknown;
+    pdfParse?: unknown;
+  };
+  const pdfParseRaw =
+    typeof moduleCandidate === "function"
+      ? moduleCandidate
+      : typeof moduleCandidate.default === "function"
+        ? moduleCandidate.default
+        : typeof (moduleCandidate.default as { default?: unknown })?.default ===
+            "function"
+          ? (moduleCandidate.default as { default: unknown }).default
+          : typeof moduleCandidate.pdfParse === "function"
+            ? moduleCandidate.pdfParse
+            : null;
+  if (typeof pdfParseRaw !== "function") {
+    throw new Error(
+      `pdf-parse export is not callable (got ${typeof pdfParseRaw}). Check pdf-parse version — expected v1.x.`,
+    );
+  }
+  const pdfParse = pdfParseRaw as (
+    data: Buffer,
+    opts?: Record<string, unknown>,
+  ) => Promise<{ text: string; numpages: number }>;
+  return pdfParse(buffer);
+}
 
 async function runCommand(
   cmd: string,
@@ -232,6 +278,13 @@ export interface AttachmentExtractionResult {
   extraction_method: ExtractionMethod;
   text_extracted: boolean;
   text_quality: "high" | "medium" | "low" | "unknown";
+  // PDF security pipeline metadata (null for non-PDFs)
+  is_encrypted: boolean | null;
+  unlock_attempted: boolean;
+  unlock_status: "success" | "failed" | null;
+  unlock_error: string | null;
+  fallback_used: boolean;
+  fallback_method: "pdf_to_images" | "ocr" | null;
   contains_structured_data: boolean;
   structured_data_type: "table" | "spreadsheet" | "json" | "xml" | "none";
   page_count: number | null;
@@ -304,6 +357,12 @@ function makeLogEntry(
     status,
     extraction_method: null,
     text_extracted: false,
+    is_encrypted: null,
+    unlock_attempted: false,
+    unlock_status: null,
+    unlock_error: null,
+    fallback_used: false,
+    fallback_method: null,
     duration_ms: Date.now() - startTime,
     error_category: null,
     error_message: null,
@@ -437,6 +496,12 @@ export async function extractAttachmentContent(
         "Attachment exceeded configured size limit and was skipped. Increase max size or process manually.",
       extraction_method: "none",
       text_extracted: false,
+      is_encrypted: null,
+      unlock_attempted: false,
+      unlock_status: null,
+      unlock_error: null,
+      fallback_used: false,
+      fallback_method: null,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -479,6 +544,12 @@ export async function extractAttachmentContent(
         "OCR is not supported in this build. Convert image content to text manually or use a dedicated OCR tool.",
       extraction_method: "none",
       text_extracted: false,
+      is_encrypted: null,
+      unlock_attempted: false,
+      unlock_status: null,
+      unlock_error: null,
+      fallback_used: false,
+      fallback_method: null,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -518,6 +589,12 @@ export async function extractAttachmentContent(
       user_action_needed: `Attachment type .${fileExtension} is not yet supported for text extraction. Raw metadata exported only.`,
       extraction_method: "none",
       text_extracted: false,
+      is_encrypted: null,
+      unlock_attempted: false,
+      unlock_status: null,
+      unlock_error: null,
+      fallback_used: false,
+      fallback_method: null,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -542,6 +619,12 @@ export async function extractAttachmentContent(
       user_action_needed: null,
       extraction_method: "none",
       text_extracted: false,
+      is_encrypted: null,
+      unlock_attempted: false,
+      unlock_status: null,
+      unlock_error: null,
+      fallback_used: false,
+      fallback_method: null,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -616,6 +699,12 @@ export async function extractAttachmentContent(
         "Retry the export. If the error persists, the attachment may have been deleted.",
       extraction_method: "none",
       text_extracted: false,
+      is_encrypted: null,
+      unlock_attempted: false,
+      unlock_status: null,
+      unlock_error: null,
+      fallback_used: false,
+      fallback_method: null,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -664,6 +753,12 @@ export async function extractAttachmentContent(
         user_action_needed: null,
         extraction_method: "plain_text",
         text_extracted: true,
+        is_encrypted: null,
+        unlock_attempted: false,
+        unlock_status: null,
+        unlock_error: null,
+        fallback_used: false,
+        fallback_method: null,
         text_quality: "high",
         contains_structured_data: false,
         structured_data_type: "none",
@@ -700,6 +795,12 @@ export async function extractAttachmentContent(
         user_action_needed: null,
         extraction_method: "html_to_text",
         text_extracted: true,
+        is_encrypted: null,
+        unlock_attempted: false,
+        unlock_status: null,
+        unlock_error: null,
+        fallback_used: false,
+        fallback_method: null,
         text_quality: "high",
         contains_structured_data: false,
         structured_data_type: "none",
@@ -735,6 +836,12 @@ export async function extractAttachmentContent(
         user_action_needed: null,
         extraction_method: "csv_parser",
         text_extracted: true,
+        is_encrypted: null,
+        unlock_attempted: false,
+        unlock_status: null,
+        unlock_error: null,
+        fallback_used: false,
+        fallback_method: null,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "table",
@@ -775,6 +882,12 @@ export async function extractAttachmentContent(
         user_action_needed: null,
         extraction_method: "json_parser",
         text_extracted: true,
+        is_encrypted: null,
+        unlock_attempted: false,
+        unlock_status: null,
+        unlock_error: null,
+        fallback_used: false,
+        fallback_method: null,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "json",
@@ -812,6 +925,12 @@ export async function extractAttachmentContent(
         user_action_needed: null,
         extraction_method: "xml_parser",
         text_extracted: true,
+        is_encrypted: null,
+        unlock_attempted: false,
+        unlock_status: null,
+        unlock_error: null,
+        fallback_used: false,
+        fallback_method: null,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "xml",
@@ -822,7 +941,7 @@ export async function extractAttachmentContent(
       };
     }
 
-    // PDF
+    // PDF — runs the security-removal pipeline (analyze → parse → unlock → retry → OCR fallback)
     if (mimeType === "application/pdf") {
       const pdfLogMeta = {
         messageId,
@@ -830,213 +949,134 @@ export async function extractAttachmentContent(
         filename,
         size: attachmentData.length,
       };
+      const warnings: string[] = [];
+      const errors: string[] = [];
 
-      console.log("[pdf.inspect.started]", pdfLogMeta);
-
-      // --- Encryption detection (no bypass: only reads the PDF dictionary marker)
-      const headSlice = attachmentData
-        .subarray(0, Math.min(attachmentData.length, 4096))
-        .toString("latin1");
-      const tailSlice = attachmentData
-        .subarray(Math.max(0, attachmentData.length - 4096))
-        .toString("latin1");
-      const looksEncrypted =
-        /\/Encrypt\s/.test(headSlice) || /\/Encrypt\s/.test(tailSlice);
-
-      console.log("[pdf.inspect.completed]", {
+      // ---- STEP 1: analyzePdfSecurity ------------------------------------
+      console.log("[pdf.analyze.started]", pdfLogMeta);
+      const analysis = await analyzePdfSecurity(attachmentData);
+      console.log("[pdf.analyze.completed]", {
         ...pdfLogMeta,
-        encrypted: looksEncrypted,
+        is_encrypted: analysis.is_encrypted,
+        requires_password: analysis.requires_password,
+        encryption_method: analysis.encryption_method,
+        permissions: analysis.permissions,
+        page_count: analysis.page_count,
       });
 
-      // Encrypted PDFs are never decrypted by this exporter. Report and skip.
-      if (looksEncrypted) {
-        console.log("[pdf.detected_encrypted]", {
-          ...pdfLogMeta,
-          action: "skip_no_decryption_attempted",
-        });
-        console.log("[pdf.page_count.fallback.started]", pdfLogMeta);
-        const encryptedPageCount = await getPdfPageCount(attachmentData);
-        if (encryptedPageCount === null) {
-          console.log("[pdf.page_count.fallback.failed]", pdfLogMeta);
-        } else {
-          console.log("[pdf.page_count.fallback.completed]", {
-            ...pdfLogMeta,
-            pages: encryptedPageCount,
-          });
-        }
-        const userAction =
-          "PDF is password-protected. Open the file in a PDF reader, save an unsecured copy with the owner's authorisation, then re-export.";
-        processingLog.push(
-          makeLogEntry(
-            messageId,
-            attachmentId,
-            filename,
-            "attachment_extraction_failed",
-            "failed",
-            startTime,
-            {
-              extraction_method: "pdf_parser",
-              error_category: "encrypted_or_password_protected",
-              error_message: "PDF is encrypted; extraction skipped.",
-              user_action_needed: userAction,
-            },
-          ),
-        );
-        return {
-          ...base,
-          is_supported: true,
-          was_downloaded: true,
-          extraction_status: "failed",
-          skip_reason: null,
-          failure_category: "encrypted_or_password_protected",
-          failure_detail:
-            "PDF is encrypted. This exporter does not attempt to decrypt protected PDFs.",
-          user_action_needed: userAction,
-          extraction_method: "pdf_parser",
-          text_extracted: false,
-          text_quality: "unknown",
-          contains_structured_data: false,
-          structured_data_type: "none",
-          page_count: encryptedPageCount,
-          sheet_names: null,
-          extracted_text: null,
-          structured_data: null,
-          errors: ["PDF encrypted; extraction skipped"],
-        };
-      }
+      let resolvedPageCount: number | null = analysis.page_count;
+      let workingBuffer: Buffer = attachmentData;
+      let unlockAttempted = false;
+      let unlockStatus: "success" | "failed" | null = null;
+      let unlockError: string | null = null;
+      let unlockPermissionsWereRestricted = false;
+      let fallbackUsed = false;
+      let fallbackMethod: "pdf_to_images" | "ocr" | null = null;
 
-      // Not encrypted → normal pdf-parse path
-      let pdfData: { text: string; numpages: number };
-      const parserUsed = "pdf-parse@1" as const;
-
+      // ---- STEP 2: try normal text extraction ----------------------------
+      let parseResult: { text: string; numpages: number } | null = null;
+      let parseError: string | null = null;
       try {
         console.log("[pdf.parse.started]", {
           ...pdfLogMeta,
-          parser: parserUsed,
+          parser: "pdf-parse@1",
         });
-        // Import directly from lib/ to avoid pdf-parse v1's index.js debug-mode
-        // side effect that tries to read a hard-coded test file at startup.
-        const pdfParseModule: unknown = await import(
-          "pdf-parse/lib/pdf-parse.js"
-        );
-        const moduleCandidate = pdfParseModule as {
-          default?: unknown;
-          pdfParse?: unknown;
-        };
-        const pdfParseRaw =
-          typeof moduleCandidate === "function"
-            ? moduleCandidate
-            : typeof moduleCandidate.default === "function"
-              ? moduleCandidate.default
-              : typeof (moduleCandidate.default as { default?: unknown })
-                    ?.default === "function"
-                ? (moduleCandidate.default as { default: unknown }).default
-                : typeof moduleCandidate.pdfParse === "function"
-                  ? moduleCandidate.pdfParse
-                  : null;
-        if (typeof pdfParseRaw !== "function") {
-          throw new Error(
-            `pdf-parse export is not callable (got ${typeof pdfParseRaw}). Check pdf-parse version — expected v1.x.`,
-          );
-        }
-        const pdfParse = pdfParseRaw as (
-          data: Buffer,
-          opts?: Record<string, unknown>,
-        ) => Promise<{ text: string; numpages: number }>;
-        pdfData = await pdfParse(attachmentData);
+        parseResult = await parsePdfBuffer(workingBuffer);
         console.log("[pdf.parse.completed]", {
           ...pdfLogMeta,
-          parser: parserUsed,
-          pages: pdfData.numpages,
-          chars: pdfData.text.length,
+          parser: "pdf-parse@1",
+          pages: parseResult.numpages,
+          chars: parseResult.text.length,
         });
-      } catch (pdfErr) {
-        const errMsg =
-          pdfErr instanceof Error ? pdfErr.message : String(pdfErr);
-        const errStack = pdfErr instanceof Error ? pdfErr.stack : undefined;
+        if (resolvedPageCount === null && parseResult.numpages > 0) {
+          resolvedPageCount = parseResult.numpages;
+        }
+      } catch (err) {
+        parseError = err instanceof Error ? err.message : String(err);
         console.log("[pdf.parse.failed]", {
           ...pdfLogMeta,
-          parser: parserUsed,
-          error: errMsg,
-          stack: errStack,
+          parser: "pdf-parse@1",
+          error: parseError,
         });
-        const lowered = errMsg.toLowerCase();
-        // Encryption was already filtered above, but a parser may still throw
-        // an encryption-related error for edge-case PDFs that hide the marker.
-        const isEncrypted =
-          lowered.includes("encrypt") ||
-          lowered.includes("password") ||
-          lowered.includes("protected");
-        const isCorrupt =
-          lowered.includes("invalid") ||
-          lowered.includes("corrupt") ||
-          lowered.includes("malformed");
-        const category: FailureCategory = isEncrypted
-          ? "encrypted_or_password_protected"
-          : isCorrupt
-            ? "corrupt_or_malformed"
-            : "parser_error";
-        const userAction = isEncrypted
-          ? "PDF is password-protected. Open the file in a PDF reader, save an unsecured copy with the owner's authorisation, then re-export."
-          : isCorrupt
-            ? "PDF appears corrupt or malformed. Try opening and re-saving the file in a PDF reader, then re-export."
-            : `PDF parsing failed: ${errMsg}`;
-        console.log("[pdf.page_count.fallback.started]", pdfLogMeta);
-        const failedPageCount = await getPdfPageCount(attachmentData);
-        if (failedPageCount === null) {
-          console.log("[pdf.page_count.fallback.failed]", pdfLogMeta);
-        } else {
-          console.log("[pdf.page_count.fallback.completed]", {
-            ...pdfLogMeta,
-            pages: failedPageCount,
-          });
-        }
-        processingLog.push(
-          makeLogEntry(
-            messageId,
-            attachmentId,
-            filename,
-            "attachment_extraction_failed",
-            "failed",
-            startTime,
-            {
-              extraction_method: "pdf_parser",
-              error_category: category,
-              error_message: errMsg,
-              user_action_needed: userAction,
-            },
-          ),
-        );
-        return {
-          ...base,
-          is_supported: true,
-          was_downloaded: true,
-          extraction_status: "failed",
-          skip_reason: null,
-          failure_category: category,
-          failure_detail: errMsg,
-          user_action_needed: userAction,
-          extraction_method: "pdf_parser",
-          text_extracted: false,
-          text_quality: "unknown",
-          contains_structured_data: false,
-          structured_data_type: "none",
-          page_count: failedPageCount,
-          sheet_names: null,
-          extracted_text: null,
-          structured_data: null,
-          errors: [errMsg],
-        };
       }
-      const text = pdfData.text.trim();
-      // Page count: trust pdf-parse, but fall back to pdfinfo / byte-scan if missing.
-      let resolvedPageCount: number | null =
-        typeof pdfData.numpages === "number" && pdfData.numpages > 0
-          ? pdfData.numpages
-          : null;
+
+      // ---- STEP 3: if extraction underperformed AND PDF has security → attemptPdfUnlock ----
+      const parsedTextSoFar = parseResult ? parseResult.text.trim() : "";
+      const parseProducedNothing =
+        parseError !== null ||
+        parsedTextSoFar.length < OCR_TRIGGER_CHAR_THRESHOLD;
+      const hasRestrictions =
+        analysis.is_encrypted ||
+        Object.values(analysis.permissions).some((v) => v === false);
+
+      if (parseProducedNothing && hasRestrictions) {
+        unlockAttempted = true;
+        console.log("[pdf.unlock.started]", {
+          ...pdfLogMeta,
+          is_encrypted: analysis.is_encrypted,
+          requires_password: analysis.requires_password,
+        });
+        const unlockTmp = await mkdtemp(join(tmpdir(), "pdf-unlock-"));
+        try {
+          const inPath = join(unlockTmp, "in.pdf");
+          const outPath = join(unlockTmp, "out.pdf");
+          await writeFile(inPath, attachmentData);
+          const unlock = await attemptPdfUnlock(inPath, outPath);
+          unlockPermissionsWereRestricted = unlock.permissions_were_restricted;
+          if (unlock.success && unlock.output_path) {
+            unlockStatus = "success";
+            console.log("[pdf.unlock.completed]", {
+              ...pdfLogMeta,
+              permissions_were_restricted:
+                unlock.permissions_were_restricted,
+            });
+            // ---- STEP 3b: retry pdf-parse on the unlocked file -----------
+            try {
+              workingBuffer = await readFile(unlock.output_path);
+              console.log("[pdf.parse.retry.started]", pdfLogMeta);
+              const retried = await parsePdfBuffer(workingBuffer);
+              parseResult = retried;
+              parseError = null;
+              console.log("[pdf.parse.retry.completed]", {
+                ...pdfLogMeta,
+                pages: retried.numpages,
+                chars: retried.text.length,
+              });
+              if (resolvedPageCount === null && retried.numpages > 0) {
+                resolvedPageCount = retried.numpages;
+              }
+            } catch (retryErr) {
+              const msg =
+                retryErr instanceof Error
+                  ? retryErr.message
+                  : String(retryErr);
+              parseError = msg;
+              console.log("[pdf.parse.retry.failed]", {
+                ...pdfLogMeta,
+                error: msg,
+              });
+            }
+          } else {
+            // ---- STEP 4: unlock failed, classify error -------------------
+            unlockStatus = "failed";
+            unlockError = unlock.error;
+            console.log("[pdf.unlock.failed]", {
+              ...pdfLogMeta,
+              category: unlock.failure_category,
+              error: unlock.error,
+            });
+          }
+        } finally {
+          await rm(unlockTmp, { recursive: true, force: true }).catch(
+            () => {},
+          );
+        }
+      }
+
+      // Final page-count fallback (defence in depth)
       if (resolvedPageCount === null) {
         console.log("[pdf.page_count.fallback.started]", pdfLogMeta);
-        resolvedPageCount = await getPdfPageCount(attachmentData);
+        resolvedPageCount = await getPdfPageCount(workingBuffer);
         if (resolvedPageCount === null) {
           console.log("[pdf.page_count.fallback.failed]", pdfLogMeta);
         } else {
@@ -1047,31 +1087,88 @@ export async function extractAttachmentContent(
         }
       }
 
-      // OCR fallback: trigger when pdf-parse extracted little or no text.
-      if (text.length < OCR_TRIGGER_CHAR_THRESHOLD) {
+      const parsedText = parseResult ? parseResult.text.trim() : "";
+      const isEncryptedFlag = analysis.is_encrypted;
+
+      // ---- Path A: parse produced enough text (with or without unlock) ---
+      if (parsedText.length >= OCR_TRIGGER_CHAR_THRESHOLD) {
+        const quality = parsedText.length < 500 ? "medium" : "high";
+        if (unlockStatus === "success" && unlockPermissionsWereRestricted) {
+          warnings.push(
+            "PDF had usage restrictions which were removed successfully.",
+          );
+        }
+        processingLog.push(
+          makeLogEntry(
+            messageId,
+            attachmentId,
+            filename,
+            "attachment_extraction_completed",
+            "success",
+            startTime,
+            { extraction_method: "pdf_parser" },
+          ),
+        );
+        return {
+          ...base,
+          is_supported: true,
+          was_downloaded: true,
+          extraction_status: "success",
+          skip_reason: null,
+          failure_category: null,
+          failure_detail: null,
+          user_action_needed:
+            unlockStatus === "success" && unlockPermissionsWereRestricted
+              ? "PDF had usage restrictions which were removed successfully."
+              : null,
+          extraction_method: "pdf_parser",
+          text_extracted: true,
+          is_encrypted: isEncryptedFlag,
+          unlock_attempted: unlockAttempted,
+          unlock_status: unlockStatus,
+          unlock_error: unlockError,
+          fallback_used: false,
+          fallback_method: null,
+          text_quality: quality,
+          contains_structured_data: false,
+          structured_data_type: "none",
+          page_count: resolvedPageCount,
+          sheet_names: null,
+          extracted_text: parsedText,
+          structured_data: null,
+          warnings,
+          errors,
+        };
+      }
+
+      // ---- STEP 5: OCR fallback (only if enabled) ------------------------
+      if (isOcrEnabled()) {
         console.log("[pdf.ocr.triggered]", {
           ...pdfLogMeta,
-          parserChars: text.length,
+          parserChars: parsedText.length,
           threshold: OCR_TRIGGER_CHAR_THRESHOLD,
-          reason: "scanned_or_image_only_pdf",
+          unlockStatus,
         });
+        fallbackUsed = true;
+        fallbackMethod = "ocr";
         try {
-          const ocrResult = await ocrPdf(attachmentData, {
+          const ocrResult = await ocrPdf(workingBuffer, {
             messageId,
             attachmentId,
             filename,
           });
-          const ocrText = ocrResult.text;
           if (resolvedPageCount === null && ocrResult.pagesTotal !== null) {
             resolvedPageCount = ocrResult.pagesTotal;
           }
-          if (ocrText.length === 0) {
+          if (ocrResult.text.length === 0) {
             console.log("[pdf.ocr.completed_empty]", {
               ...pdfLogMeta,
               pagesProcessed: ocrResult.pagesProcessed,
             });
-            const userAction =
-              "PDF appears to be a scanned/image-based document and OCR could not recognise any text. Verify the source document quality.";
+            const userAction = analysis.requires_password
+              ? "PDF is password protected. Provide password or remove security manually."
+              : "PDF appears to be a scanned/image-based document and OCR could not recognise any text. Verify the source document quality.";
+            errors.push("OCR returned no text");
             processingLog.push(
               makeLogEntry(
                 messageId,
@@ -1094,11 +1191,20 @@ export async function extractAttachmentContent(
               was_downloaded: true,
               extraction_status: "failed",
               skip_reason: null,
-              failure_category: "ocr_failed",
-              failure_detail: "OCR processed all pages but extracted no text.",
+              failure_category: analysis.requires_password
+                ? "encrypted_or_password_protected"
+                : "ocr_failed",
+              failure_detail:
+                "OCR processed all pages but extracted no text.",
               user_action_needed: userAction,
               extraction_method: "ocr",
               text_extracted: false,
+              is_encrypted: isEncryptedFlag,
+              unlock_attempted: unlockAttempted,
+              unlock_status: unlockStatus,
+              unlock_error: unlockError,
+              fallback_used: true,
+              fallback_method: "ocr",
               text_quality: "unknown",
               contains_structured_data: false,
               structured_data_type: "none",
@@ -1106,21 +1212,45 @@ export async function extractAttachmentContent(
               sheet_names: null,
               extracted_text: null,
               structured_data: null,
-              warnings: [],
-              errors: ["OCR returned no text"],
+              warnings,
+              errors,
             };
           }
+          // OCR success path
           console.log("[pdf.ocr.completed]", {
             ...pdfLogMeta,
             pagesProcessed: ocrResult.pagesProcessed,
-            chars: ocrText.length,
+            chars: ocrResult.text.length,
           });
-          const ocrQuality =
-            ocrText.length < 200
+          const ocrConfidence =
+            ocrResult.text.length < 200
               ? "low"
-              : ocrText.length < 2000
+              : ocrResult.text.length < 2000
                 ? "medium"
                 : "high";
+          warnings.push(
+            `OCR fallback used (${ocrResult.pagesProcessed} pages OCR'd${
+              ocrResult.pagesTotal &&
+              ocrResult.pagesTotal > ocrResult.pagesProcessed
+                ? `; ${ocrResult.pagesTotal - ocrResult.pagesProcessed} pages skipped due to ${OCR_MAX_PAGES}-page cap`
+                : ""
+            }).`,
+          );
+          if (ocrConfidence === "low") {
+            warnings.push(
+              "OCR text marked as LOW CONFIDENCE due to limited extracted content.",
+            );
+          }
+          if (parsedText.length > 0) {
+            warnings.push(
+              `pdf-parse extracted ${parsedText.length} chars before OCR fallback.`,
+            );
+          }
+          if (unlockStatus === "success" && unlockPermissionsWereRestricted) {
+            warnings.push(
+              "PDF had usage restrictions which were removed successfully.",
+            );
+          }
           processingLog.push(
             makeLogEntry(
               messageId,
@@ -1136,39 +1266,92 @@ export async function extractAttachmentContent(
             ...base,
             is_supported: true,
             was_downloaded: true,
-            extraction_status: "success",
+            extraction_status:
+              ocrConfidence === "low" ? "partial" : "success",
             skip_reason: null,
             failure_category: null,
             failure_detail: null,
-            user_action_needed: null,
+            user_action_needed:
+              ocrConfidence === "low"
+                ? "OCR returned low-confidence text. Verify accuracy if it matters for downstream use."
+                : unlockStatus === "success" &&
+                    unlockPermissionsWereRestricted
+                  ? "PDF had usage restrictions which were removed successfully."
+                  : null,
             extraction_method:
-              text.length > 0 ? "pdf_parser+ocr" : "ocr",
+              parsedText.length > 0 ? "pdf_parser+ocr" : "ocr",
             text_extracted: true,
-            text_quality: ocrQuality,
+            is_encrypted: isEncryptedFlag,
+            unlock_attempted: unlockAttempted,
+            unlock_status: unlockStatus,
+            unlock_error: unlockError,
+            fallback_used: true,
+            fallback_method: "ocr",
+            text_quality: ocrConfidence,
             contains_structured_data: false,
             structured_data_type: "none",
             page_count: resolvedPageCount,
             sheet_names: null,
-            extracted_text: ocrText,
+            extracted_text: ocrResult.text,
             structured_data: null,
-            warnings: [
-              `pdf-parse extracted only ${text.length} chars; OCR fallback used (${ocrResult.pagesProcessed} pages processed${
-                ocrResult.pagesTotal && ocrResult.pagesTotal > ocrResult.pagesProcessed
-                  ? `, ${ocrResult.pagesTotal - ocrResult.pagesProcessed} pages skipped due to ${OCR_MAX_PAGES}-page OCR cap`
-                  : ""
-              }).`,
-            ],
-            errors: [],
+            warnings,
+            errors,
           };
         } catch (ocrErr) {
           const errMsg =
             ocrErr instanceof Error ? ocrErr.message : String(ocrErr);
-          console.log("[pdf.ocr.failed]", {
-            ...pdfLogMeta,
-            error: errMsg,
-          });
-          const userAction =
-            "PDF appears to be a scanned/image-based document and OCR failed. Verify the source document is not corrupt and try again.";
+          console.log("[pdf.ocr.failed]", { ...pdfLogMeta, error: errMsg });
+          errors.push(errMsg);
+          // ---- STEP 6: OCR failed → still emit metadata + image refs ----
+          let imagesRendered = 0;
+          let imagesError: string | null = null;
+          try {
+            console.log("[pdf.images.fallback.started]", pdfLogMeta);
+            const imgTmp = await mkdtemp(join(tmpdir(), "pdf-img-ref-"));
+            try {
+              const inPath = join(imgTmp, "in.pdf");
+              await writeFile(inPath, workingBuffer);
+              const conv = await convertPdfToImages(inPath, {
+                dpi: 150,
+                maxPages: OCR_MAX_PAGES,
+              });
+              if (conv.success) {
+                imagesRendered = conv.image_paths.length;
+                console.log("[pdf.images.fallback.completed]", {
+                  ...pdfLogMeta,
+                  imagesRendered,
+                });
+                if (conv.output_dir) {
+                  await rm(conv.output_dir, {
+                    recursive: true,
+                    force: true,
+                  }).catch(() => {});
+                }
+              } else {
+                imagesError = conv.error;
+                console.log("[pdf.images.fallback.failed]", {
+                  ...pdfLogMeta,
+                  error: conv.error,
+                });
+              }
+            } finally {
+              await rm(imgTmp, { recursive: true, force: true }).catch(
+                () => {},
+              );
+            }
+          } catch (imgErr) {
+            imagesError =
+              imgErr instanceof Error ? imgErr.message : String(imgErr);
+          }
+          if (imagesRendered > 0) {
+            warnings.push(
+              `Fallback image conversion succeeded: ${imagesRendered} pages rendered (not embedded; reference only).`,
+            );
+            fallbackMethod = "pdf_to_images";
+          }
+          const userAction = analysis.requires_password
+            ? "PDF is password protected. Provide password or remove security manually."
+            : "PDF appears to be a scanned/image-based document and OCR failed. Verify the source document is not corrupt and try again.";
           processingLog.push(
             makeLogEntry(
               messageId,
@@ -1191,11 +1374,19 @@ export async function extractAttachmentContent(
             was_downloaded: true,
             extraction_status: "failed",
             skip_reason: null,
-            failure_category: "ocr_failed",
+            failure_category: analysis.requires_password
+              ? "encrypted_or_password_protected"
+              : "ocr_failed",
             failure_detail: errMsg,
             user_action_needed: userAction,
             extraction_method: "ocr",
             text_extracted: false,
+            is_encrypted: isEncryptedFlag,
+            unlock_attempted: unlockAttempted,
+            unlock_status: unlockStatus,
+            unlock_error: unlockError,
+            fallback_used: true,
+            fallback_method: fallbackMethod ?? "ocr",
             text_quality: "unknown",
             contains_structured_data: false,
             structured_data_type: "none",
@@ -1203,43 +1394,82 @@ export async function extractAttachmentContent(
             sheet_names: null,
             extracted_text: null,
             structured_data: null,
-            warnings: [],
-            errors: [errMsg],
+            warnings,
+            errors: imagesError
+              ? [...errors, `image-fallback: ${imagesError}`]
+              : errors,
           };
         }
       }
 
-      const quality =
-        text.length < 50 ? "low" : text.length < 500 ? "medium" : "high";
+      // ---- STEP 6 (OCR disabled): emit metadata + clear failure ----------
+      const userActionDisabled = analysis.requires_password
+        ? "PDF is password protected. Provide password or remove security manually."
+        : unlockStatus === "failed"
+          ? userActionForUnlock(
+              analysis,
+              {
+                success: false,
+                output_path: null,
+                error: unlockError,
+                failure_category: "encrypted_or_password_protected",
+                permissions_were_restricted:
+                  unlockPermissionsWereRestricted,
+              },
+              "failed",
+            ) ??
+            "PDF could not be unlocked. Provide an unsecured copy and re-export."
+          : "PDF parser produced no text and OCR is disabled. Set OCR_ENABLED=true to extract text from scanned/image-based PDFs.";
+      const failCategory: FailureCategory = analysis.requires_password
+        ? "encrypted_or_password_protected"
+        : parseError
+          ? "parser_error"
+          : "ocr_failed";
       processingLog.push(
         makeLogEntry(
           messageId,
           attachmentId,
           filename,
-          "attachment_extraction_completed",
-          "success",
+          "attachment_extraction_failed",
+          "failed",
           startTime,
-          { extraction_method: "pdf_parser" },
+          {
+            extraction_method: "pdf_parser",
+            error_category: failCategory,
+            error_message:
+              parseError ?? "No text extracted and OCR disabled.",
+            user_action_needed: userActionDisabled,
+          },
         ),
       );
       return {
         ...base,
         is_supported: true,
         was_downloaded: true,
-        extraction_status: "success",
+        extraction_status: "failed",
         skip_reason: null,
-        failure_category: null,
-        failure_detail: null,
-        user_action_needed: null,
+        failure_category: failCategory,
+        failure_detail:
+          parseError ??
+          "pdf-parse produced no text and OCR fallback is disabled.",
+        user_action_needed: userActionDisabled,
         extraction_method: "pdf_parser",
-        text_extracted: true,
-        text_quality: quality,
+        text_extracted: false,
+        is_encrypted: isEncryptedFlag,
+        unlock_attempted: unlockAttempted,
+        unlock_status: unlockStatus,
+        unlock_error: unlockError,
+        fallback_used: false,
+        fallback_method: null,
+        text_quality: "unknown",
         contains_structured_data: false,
         structured_data_type: "none",
         page_count: resolvedPageCount,
         sheet_names: null,
-        extracted_text: text || null,
+        extracted_text: null,
         structured_data: null,
+        warnings,
+        errors: parseError ? [parseError, ...errors] : errors,
       };
     }
 
@@ -1292,6 +1522,12 @@ export async function extractAttachmentContent(
           user_action_needed: userAction,
           extraction_method: "docx_parser",
           text_extracted: false,
+          is_encrypted: null,
+          unlock_attempted: false,
+          unlock_status: null,
+          unlock_error: null,
+          fallback_used: false,
+          fallback_method: null,
           text_quality: "unknown",
           contains_structured_data: false,
           structured_data_type: "none",
@@ -1325,6 +1561,12 @@ export async function extractAttachmentContent(
         user_action_needed: null,
         extraction_method: "docx_parser",
         text_extracted: true,
+        is_encrypted: null,
+        unlock_attempted: false,
+        unlock_status: null,
+        unlock_error: null,
+        fallback_used: false,
+        fallback_method: null,
         text_quality: "high",
         contains_structured_data: false,
         structured_data_type: "none",
@@ -1385,6 +1627,12 @@ export async function extractAttachmentContent(
           user_action_needed: userAction,
           extraction_method: "xlsx_parser",
           text_extracted: false,
+          is_encrypted: null,
+          unlock_attempted: false,
+          unlock_status: null,
+          unlock_error: null,
+          fallback_used: false,
+          fallback_method: null,
           text_quality: "unknown",
           contains_structured_data: true,
           structured_data_type: "spreadsheet",
@@ -1431,6 +1679,12 @@ export async function extractAttachmentContent(
         user_action_needed: null,
         extraction_method: "xlsx_parser",
         text_extracted: true,
+        is_encrypted: null,
+        unlock_attempted: false,
+        unlock_status: null,
+        unlock_error: null,
+        fallback_used: false,
+        fallback_method: null,
         text_quality: "high",
         contains_structured_data: true,
         structured_data_type: "spreadsheet",
@@ -1454,6 +1708,12 @@ export async function extractAttachmentContent(
       user_action_needed: null,
       extraction_method: "none",
       text_extracted: true,
+      is_encrypted: null,
+      unlock_attempted: false,
+      unlock_status: null,
+      unlock_error: null,
+      fallback_used: false,
+      fallback_method: null,
       text_quality: "low",
       contains_structured_data: false,
       structured_data_type: "none",
@@ -1494,6 +1754,12 @@ export async function extractAttachmentContent(
         "An unexpected error occurred during extraction. Retry the export.",
       extraction_method: "none",
       text_extracted: false,
+      is_encrypted: null,
+      unlock_attempted: false,
+      unlock_status: null,
+      unlock_error: null,
+      fallback_used: false,
+      fallback_method: null,
       text_quality: "unknown",
       contains_structured_data: false,
       structured_data_type: "none",
