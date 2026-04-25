@@ -35,6 +35,22 @@ interface ExportToolbarProps {
   selectedMessageIds: string[];
   queryUsed?: string;
   searchFilters?: Record<string, unknown>;
+  /**
+   * Total number of search hits Gmail reported for this query (the
+   * approximate `resultSizeEstimate`). Used to show "Export all matching
+   * (~N)" — not the cap actually exported.
+   */
+  totalEstimate?: number;
+  /**
+   * If the search-form gave us an `includeSpamTrash` choice, forward it so
+   * the server-side re-fetch matches what the user is seeing.
+   */
+  includeSpamTrash?: boolean;
+  /**
+   * Hard cap to send to the server when the user clicks "Export all
+   * matching results". Server still enforces a 500 ceiling.
+   */
+  exportAllCap?: number;
   onClearSelection: () => void;
   onExportComplete?: (result: ExportResult) => void;
 }
@@ -155,6 +171,9 @@ export function ExportToolbar({
   selectedMessageIds,
   queryUsed,
   searchFilters,
+  totalEstimate,
+  includeSpamTrash,
+  exportAllCap = 500,
   onClearSelection,
   onExportComplete,
 }: ExportToolbarProps) {
@@ -224,10 +243,45 @@ export function ExportToolbar({
     }
   };
 
-  const handleExport = async () => {
-    if (selectedMessageIds.length === 0 || isPending) return;
+  const handleExport = async (mode: "selected" | "all_matching") => {
+    if (isPending) return;
+    if (mode === "selected" && selectedMessageIds.length === 0) {
+      toast({
+        variant: "destructive",
+        description: "No emails selected. Pick at least one row first.",
+      });
+      return;
+    }
+    if (mode === "all_matching" && (!queryUsed || queryUsed.trim() === "")) {
+      toast({
+        variant: "destructive",
+        description:
+          "Run a search first — there's no query to export results for.",
+      });
+      return;
+    }
     setIsPending(true);
     try {
+      // Build the payload based on mode. When the user picks "Export all
+      // matching results", we deliberately send messageIds=[] + the flag so
+      // the server re-executes the Gmail query and exports every hit.
+      const payload =
+        mode === "selected"
+          ? {
+              messageIds: selectedMessageIds,
+              queryUsed,
+              chunkLargeBodies: false,
+              ...(searchFilters ? { searchFilters } : {}),
+            }
+          : {
+              messageIds: [] as string[],
+              queryUsed,
+              exportAllResults: true,
+              maxResults: exportAllCap,
+              includeSpamTrash: !!includeSpamTrash,
+              chunkLargeBodies: false,
+              ...(searchFilters ? { searchFilters } : {}),
+            };
       const response = await fetch("/api/gmail/export", {
         method: "POST",
         credentials: "include",
@@ -235,12 +289,7 @@ export function ExportToolbar({
           "Content-Type": "application/json",
           Accept: "application/zip",
         },
-        body: JSON.stringify({
-          messageIds: selectedMessageIds,
-          queryUsed,
-          chunkLargeBodies: false,
-          ...(searchFilters ? { searchFilters } : {}),
-        }),
+        body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
@@ -335,32 +384,74 @@ export function ExportToolbar({
     }
   };
 
+  // Whether there's a meaningful "all matching" target. We require both a
+  // query AND at least one row currently shown — otherwise the button would
+  // either trigger an empty re-fetch or run a query the user can't see the
+  // basis for.
+  const canExportAll =
+    !!queryUsed && queryUsed.trim() !== "" && (totalEstimate ?? 0) > 0;
+  const allMatchingLabel = canExportAll
+    ? totalEstimate && totalEstimate > exportAllCap
+      ? `Export all matching (~${totalEstimate}, capped at ${exportAllCap})`
+      : `Export all matching${
+          totalEstimate ? ` (~${totalEstimate})` : ""
+        }`
+    : "Export all matching";
+
   if (selectedCount === 0) {
     return (
-      <div className="h-10 flex items-center justify-between px-2 text-sm text-muted-foreground">
-        <span>Select emails below to export.</span>
-        {latestAvailable ? (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleDownloadLatest}
-            disabled={downloadingLatest}
-            className="h-8 px-2 text-xs"
-            data-testid="button-download-latest-empty"
-            title={
-              latestMtime
-                ? `Last export: ${new Date(latestMtime).toLocaleString()}`
-                : "Re-download the most recent export"
-            }
-          >
-            {downloadingLatest ? (
-              <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
-            ) : (
-              <History className="h-3.5 w-3.5 mr-1" />
-            )}
-            Download Latest
-          </Button>
-        ) : null}
+      <div className="h-10 flex items-center justify-between px-2 text-sm text-muted-foreground gap-2 flex-wrap">
+        <span className="truncate">
+          {canExportAll
+            ? "Select emails below, or export all matching results."
+            : "Run a search to load emails, then select rows to export."}
+        </span>
+        <div className="flex items-center gap-2">
+          {canExportAll && (
+            <Button
+              variant="default"
+              size="sm"
+              onClick={() => handleExport("all_matching")}
+              disabled={isPending}
+              className="h-8"
+              data-testid="button-export-all-matching"
+              title={
+                totalEstimate
+                  ? `Re-runs the Gmail query server-side and exports up to ${exportAllCap} matching messages (Gmail estimates ~${totalEstimate}).`
+                  : "Re-runs the Gmail query server-side and exports every matching message."
+              }
+            >
+              {isPending ? (
+                <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Download className="mr-2 h-3.5 w-3.5" />
+              )}
+              {allMatchingLabel}
+            </Button>
+          )}
+          {latestAvailable ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleDownloadLatest}
+              disabled={downloadingLatest}
+              className="h-8 px-2 text-xs"
+              data-testid="button-download-latest-empty"
+              title={
+                latestMtime
+                  ? `Last export: ${new Date(latestMtime).toLocaleString()}`
+                  : "Re-download the most recent export"
+              }
+            >
+              {downloadingLatest ? (
+                <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+              ) : (
+                <History className="h-3.5 w-3.5 mr-1" />
+              )}
+              Download Latest
+            </Button>
+          ) : null}
+        </div>
       </div>
     );
   }
@@ -420,18 +511,44 @@ export function ExportToolbar({
             </Button>
           )}
 
+          {canExportAll && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleExport("all_matching")}
+              disabled={isPending}
+              className="h-9"
+              data-testid="button-execute-export-all"
+              title={
+                totalEstimate
+                  ? `Re-runs the Gmail query and exports up to ${exportAllCap} matching messages (Gmail estimates ~${totalEstimate}).`
+                  : "Re-runs the Gmail query and exports every matching message."
+              }
+            >
+              {isPending ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Download className="mr-2 h-4 w-4" />
+              )}
+              {allMatchingLabel}
+            </Button>
+          )}
+
           <Button
-            onClick={handleExport}
+            onClick={() => handleExport("selected")}
             disabled={isPending}
             className="h-9"
             data-testid="button-execute-export"
+            title={`Export the ${selectedCount} selected message${selectedCount === 1 ? "" : "s"} as a ZIP bundle.`}
           >
             {isPending ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             ) : (
               <Download className="mr-2 h-4 w-4" />
             )}
-            {isPending ? "Building ZIP…" : "Export ZIP"}
+            {isPending
+              ? "Building ZIP…"
+              : `Export selected (${selectedCount})`}
           </Button>
         </div>
       </div>

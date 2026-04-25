@@ -509,7 +509,10 @@ components:
           type: array
           items:
             type: string
-          description: IDs of messages to export
+          description: |-
+            IDs of messages to export. May be empty when `exportAllResults`
+            is true, in which case the server re-runs `queryUsed` against
+            Gmail and exports every matching message (capped at `maxResults`).
         queryUsed:
           type: string
           description: The search query that produced these results
@@ -520,6 +523,29 @@ components:
           type: object
           description: Structured search filters used for this export
           additionalProperties: true
+        exportAllResults:
+          type: boolean
+          default: false
+          description: |-
+            When true and `messageIds` is empty, the server re-executes
+            `queryUsed` against Gmail and exports every message it returns
+            (up to `maxResults`). When true and `messageIds` is non-empty,
+            the explicit ids win.
+        maxResults:
+          type: integer
+          minimum: 1
+          maximum: 500
+          default: 500
+          description: |-
+            Cap on the number of messages re-fetched when
+            `exportAllResults` is true. Ignored when `messageIds` is
+            non-empty. Hard server cap is 500.
+        includeSpamTrash:
+          type: boolean
+          default: false
+          description: |-
+            Mirrors the search-time `includeSpamTrash` flag. Only used
+            when `exportAllResults` triggers a server-side re-fetch.
       required:
         - messageIds
 

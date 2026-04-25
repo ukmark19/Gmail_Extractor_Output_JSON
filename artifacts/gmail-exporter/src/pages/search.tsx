@@ -38,6 +38,10 @@ export default function SearchPage() {
     setSelectedMessageIds(new Set());
     setPreviewMessageId(null);
     setLastExportResult(null);
+    // Clear the previous run's totalEstimate so the "Export all matching
+    // (~N)" button doesn't briefly show a stale number while the new search
+    // is in flight.
+    setTotalEstimate(0);
     executeSearch(query, values, undefined);
   };
 
@@ -136,6 +140,8 @@ export default function SearchPage() {
                 selectedMessageIds={Array.from(selectedMessageIds)}
                 queryUsed={searchParams?.query}
                 searchFilters={searchFilters}
+                totalEstimate={totalEstimate}
+                includeSpamTrash={searchParams?.values.includeSpamTrash}
                 onClearSelection={() => setSelectedMessageIds(new Set())}
                 onExportComplete={handleExportComplete}
               />

@@ -132,13 +132,31 @@ export interface LabelsResponse {
 export type ExportEmailsBodySearchFilters = { [key: string]: unknown };
 
 export interface ExportEmailsBody {
-  /** IDs of messages to export */
+  /** IDs of messages to export. May be empty when `exportAllResults`
+is true, in which case the server re-runs `queryUsed` against
+Gmail and exports every matching message (capped at `maxResults`). */
   messageIds: string[];
   /** The search query that produced these results */
   queryUsed?: string;
   chunkLargeBodies?: boolean;
   /** Structured search filters used for this export */
   searchFilters?: ExportEmailsBodySearchFilters;
+  /** When true and `messageIds` is empty, the server re-executes
+`queryUsed` against Gmail and exports every message it returns
+(up to `maxResults`). When true and `messageIds` is non-empty,
+the explicit ids win. */
+  exportAllResults?: boolean;
+  /**
+   * Cap on the number of messages re-fetched when
+`exportAllResults` is true. Ignored when `messageIds` is
+non-empty. Hard server cap is 500.
+   * @minimum 1
+   * @maximum 500
+   */
+  maxResults?: number;
+  /** Mirrors the search-time `includeSpamTrash` flag. Only used
+when `exportAllResults` triggers a server-side re-fetch. */
+  includeSpamTrash?: boolean;
 }
 
 export type ExportEmailsResponseFullExportItem = { [key: string]: unknown };

@@ -159,9 +159,18 @@ export const GetLabelsResponse = zod.object({
  * @summary Export selected email messages to JSON
  */
 export const exportEmailsBodyChunkLargeBodiesDefault = false;
+export const exportEmailsBodyExportAllResultsDefault = false;
+export const exportEmailsBodyMaxResultsDefault = 500;
+export const exportEmailsBodyMaxResultsMax = 500;
+
+export const exportEmailsBodyIncludeSpamTrashDefault = false;
 
 export const ExportEmailsBody = zod.object({
-  messageIds: zod.array(zod.string()).describe("IDs of messages to export"),
+  messageIds: zod
+    .array(zod.string())
+    .describe(
+      "IDs of messages to export. May be empty when `exportAllResults`\nis true, in which case the server re-runs `queryUsed` against\nGmail and exports every matching message (capped at `maxResults`).",
+    ),
   queryUsed: zod
     .string()
     .optional()
@@ -173,6 +182,26 @@ export const ExportEmailsBody = zod.object({
     .record(zod.string(), zod.unknown())
     .optional()
     .describe("Structured search filters used for this export"),
+  exportAllResults: zod
+    .boolean()
+    .default(exportEmailsBodyExportAllResultsDefault)
+    .describe(
+      "When true and `messageIds` is empty, the server re-executes\n`queryUsed` against Gmail and exports every message it returns\n(up to `maxResults`). When true and `messageIds` is non-empty,\nthe explicit ids win.",
+    ),
+  maxResults: zod
+    .number()
+    .min(1)
+    .max(exportEmailsBodyMaxResultsMax)
+    .default(exportEmailsBodyMaxResultsDefault)
+    .describe(
+      "Cap on the number of messages re-fetched when\n`exportAllResults` is true. Ignored when `messageIds` is\nnon-empty. Hard server cap is 500.",
+    ),
+  includeSpamTrash: zod
+    .boolean()
+    .default(exportEmailsBodyIncludeSpamTrashDefault)
+    .describe(
+      "Mirrors the search-time `includeSpamTrash` flag. Only used\nwhen `exportAllResults` triggers a server-side re-fetch.",
+    ),
 });
 
 export const ExportEmailsResponse = zod.object({

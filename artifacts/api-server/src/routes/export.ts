@@ -105,28 +105,103 @@ router.post(
   requireAuth as unknown as (req: unknown, res: unknown, next: () => void) => Promise<void>,
   async (req, res): Promise<void> => {
     const session = req.session as { userId?: number };
+    const exportStart = Date.now();
+    // Diagnostics buffer that grows BEFORE the validated payload is even
+    // available, so we can attribute parse failures to a specific request.
+    const processingLog: ProcessingLogEntry[] = [];
+
+    // Snapshot of the raw payload shape (NEVER include actual ids in logs in
+    // production-leaning detail; we log lengths + types so the user can
+    // diagnose "0 emails exported" without spilling message ids to disk).
+    const rawBody = (req.body ?? {}) as Record<string, unknown>;
+    const rawMsgIds = Array.isArray(rawBody.messageIds)
+      ? (rawBody.messageIds as unknown[])
+      : [];
+    const payloadDigest = {
+      selectedMessageIds_count: rawMsgIds.length,
+      selectedMessageIds_sample: rawMsgIds.slice(0, 3),
+      query: typeof rawBody.queryUsed === "string" ? rawBody.queryUsed : null,
+      exportMode:
+        rawBody.exportAllResults === true ? "all_matching" : "selected",
+      includeAttachments: true, // currently always true; reserved for future toggle
+      resultCount: rawMsgIds.length,
+      hasSearchFilters: !!rawBody.searchFilters,
+      maxResults:
+        typeof rawBody.maxResults === "number" ? rawBody.maxResults : 500,
+      includeSpamTrash: rawBody.includeSpamTrash === true,
+    };
+    req.log.info(
+      { ...payloadDigest, user_id: session.userId },
+      "[export] export_requested — raw payload received",
+    );
+    processingLog.push(
+      makeLog("", null, null, "export_requested", "received", {
+        error_message: JSON.stringify({
+          user_id: session.userId,
+          ...payloadDigest,
+        }),
+      }),
+    );
 
     const parsed = ExportEmailsBody.safeParse(req.body);
     if (!parsed.success) {
+      req.log.warn(
+        { issues: parsed.error.format() },
+        "[export] payload failed schema validation",
+      );
       res.status(400).json({ error: parsed.error.message });
       return;
     }
 
-    const { messageIds, queryUsed, chunkLargeBodies = false } = parsed.data;
+    const {
+      messageIds: bodyMessageIds,
+      queryUsed,
+      chunkLargeBodies = false,
+    } = parsed.data;
+    const exportAllResults = (parsed.data as Record<string, unknown>)
+      .exportAllResults === true;
+    const requestedMaxResults = Math.max(
+      1,
+      Math.min(
+        500,
+        Number(
+          (parsed.data as Record<string, unknown>).maxResults ?? 500,
+        ) || 500,
+      ),
+    );
+    const includeSpamTrash =
+      (parsed.data as Record<string, unknown>).includeSpamTrash === true;
     const searchFilters = (parsed.data as Record<string, unknown>)
       .searchFilters as Record<string, unknown> | undefined;
 
-    if (messageIds.length === 0) {
-      res.status(400).json({ error: "No messages to export" });
-      return;
-    }
+    processingLog.push(
+      makeLog("", null, null, "export_payload_received", "ok", {
+        error_message: JSON.stringify({
+          messageIds_count: bodyMessageIds.length,
+          exportAllResults,
+          queryUsed: queryUsed ?? null,
+          maxResults: requestedMaxResults,
+          includeSpamTrash,
+        }),
+      }),
+    );
 
-    if (messageIds.length > 500) {
+    // Hard cap on explicitly-selected ids
+    if (bodyMessageIds.length > 500) {
       res
         .status(400)
         .json({ error: "Cannot export more than 500 messages at once" });
       return;
     }
+
+    // Resolve the FINAL set of messageIds we'll export. Three branches:
+    //   1. Explicit selection wins (most predictable for the user).
+    //   2. Else exportAllResults + non-empty queryUsed → re-run Gmail
+    //      search server-side and use those ids.
+    //   3. Else hard-fail with a clear message — never silently produce
+    //      an empty export.
+    let messageIds: string[] = bodyMessageIds;
+    let resolutionMode: "selected" | "all_matching" = "selected";
 
     try {
       const [user] = await db
@@ -148,7 +223,137 @@ router.post(
 
       const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
-      const processingLog: ProcessingLogEntry[] = [];
+      if (messageIds.length === 0) {
+        if (exportAllResults && queryUsed && queryUsed.trim().length > 0) {
+          resolutionMode = "all_matching";
+          req.log.info(
+            { query: queryUsed, max: requestedMaxResults, includeSpamTrash },
+            "[export] no message ids supplied — re-running Gmail query server-side",
+          );
+          processingLog.push(
+            makeLog("", null, null, "export_query_used", "rerun", {
+              error_message: JSON.stringify({
+                query: queryUsed,
+                maxResults: requestedMaxResults,
+                includeSpamTrash,
+              }),
+            }),
+          );
+          const collected: string[] = [];
+          let pageToken: string | undefined;
+          let pages = 0;
+          // Re-page through Gmail until we hit requestedMaxResults or run out.
+          // Gmail caps each page at ~500; we still respect the per-export 500.
+          while (collected.length < requestedMaxResults && pages < 10) {
+            const pageSize = Math.min(
+              500,
+              requestedMaxResults - collected.length,
+            );
+            const r = await gmail.users.messages.list({
+              userId: "me",
+              q: queryUsed,
+              maxResults: pageSize,
+              pageToken,
+              includeSpamTrash,
+            });
+            const ids = (r.data.messages || [])
+              .map((m) => m.id || "")
+              .filter(Boolean);
+            collected.push(...ids);
+            pageToken = r.data.nextPageToken || undefined;
+            pages += 1;
+            if (!pageToken) break;
+          }
+          messageIds = collected.slice(0, requestedMaxResults);
+          req.log.info(
+            { resolved_count: messageIds.length, pages_fetched: pages },
+            "[export] server-side re-fetch resolved message ids",
+          );
+        } else {
+          // Final guard: never silently emit a 0-email export. Emit the
+          // required diagnostic events on this failure exit too so anyone
+          // tailing the processing log sees the same six event names.
+          processingLog.push(
+            makeLog("", null, null, "export_message_ids_count", "failed", {
+              error_category: "no_selection",
+              error_message: JSON.stringify({ count: 0, mode: "none" }),
+            }),
+          );
+          processingLog.push(
+            makeLog("", null, null, "export_query_used", "skipped", {
+              error_message: JSON.stringify({ query: queryUsed ?? "" }),
+            }),
+          );
+          processingLog.push(
+            makeLog("", null, null, "export_completed", "failed", {
+              duration_ms: Date.now() - exportStart,
+              error_category: "no_selection",
+              error_message:
+                "No messageIds and no exportAllResults+queryUsed flag.",
+            }),
+          );
+          res.status(400).json({
+            error:
+              "No emails selected for export. Either pick at least one message or set exportAllResults=true with a non-empty queryUsed.",
+            processingLog,
+          });
+          return;
+        }
+      }
+
+      processingLog.push(
+        makeLog("", null, null, "export_message_ids_count", "ok", {
+          error_message: JSON.stringify({
+            count: messageIds.length,
+            mode: resolutionMode,
+          }),
+        }),
+      );
+      // Always emit `export_query_used` so the event sequence is consistent
+      // across runs. When no query was used (pure selection), we record an
+      // empty query string with a "none" status — that tells a future
+      // debugger that the absence was intentional, not dropped logging.
+      processingLog.push(
+        makeLog(
+          "",
+          null,
+          null,
+          "export_query_used",
+          queryUsed ? "ok" : "none",
+          {
+            error_message: JSON.stringify({ query: queryUsed ?? "" }),
+          },
+        ),
+      );
+
+      if (messageIds.length === 0) {
+        // Could happen if "all matching" returned zero from Gmail.
+        processingLog.push(
+          makeLog("", null, null, "export_messages_loaded_count", "failed", {
+            error_category: "no_results",
+            error_message: JSON.stringify({
+              requested: 0,
+              loaded: 0,
+              missing: 0,
+              mode: resolutionMode,
+            }),
+          }),
+        );
+        processingLog.push(
+          makeLog("", null, null, "export_completed", "failed", {
+            duration_ms: Date.now() - exportStart,
+            error_category: "no_results",
+            error_message: "Gmail returned 0 messages for queryUsed.",
+          }),
+        );
+        res.status(400).json({
+          error:
+            "Gmail returned 0 messages for this query. Refine the search and try again.",
+          processingLog,
+        });
+        return;
+      }
+
       const emailBundles: Array<{
         email: EmailData;
         attachments: AttachmentExtractionResult[];
@@ -163,10 +368,13 @@ router.post(
       let totalAttachmentsFailed = 0;
       let totalAttachmentsUnsupported = 0;
       let totalEmailsWithLabel = 0;
-      const exportStart = Date.now();
 
       req.log.info(
-        { message_count: messageIds.length },
+        {
+          message_count: messageIds.length,
+          mode: resolutionMode,
+          user_id: session.userId,
+        },
         "[export] starting bundle export",
       );
 
@@ -489,6 +697,42 @@ router.post(
         }
       }
 
+      // Hard guard against the "silent 0-email ZIP" failure mode: if every
+      // single message fetch failed (network, revoked token, deleted msg,
+      // etc.) we still have a non-empty `messageIds` resolution but
+      // `emailBundles` is empty. Don't build a bundle the user can't use —
+      // surface the failure clearly with the same diagnostic events.
+      if (emailBundles.length === 0) {
+        processingLog.push(
+          makeLog("", null, null, "export_messages_loaded_count", "failed", {
+            error_category: "all_fetches_failed",
+            error_message: JSON.stringify({
+              requested: messageIds.length,
+              loaded: 0,
+              missing: messageIds.length,
+              mode: resolutionMode,
+            }),
+          }),
+        );
+        processingLog.push(
+          makeLog("", null, null, "export_completed", "failed", {
+            duration_ms: Date.now() - exportStart,
+            error_category: "all_fetches_failed",
+            error_message:
+              "All Gmail message fetches failed; no emails could be exported.",
+          }),
+        );
+        req.log.error(
+          { requested: messageIds.length, mode: resolutionMode },
+          "[export] every per-message fetch failed; refusing to write empty ZIP",
+        );
+        return res.status(502).json({
+          error:
+            "Could not load any of the requested emails from Gmail. Try again, or refine the selection.",
+          processingLog,
+        });
+      }
+
       const queryContext: QueryContext = {
         generated_gmail_query: queryUsed || "",
         search_filters: {
@@ -515,6 +759,23 @@ router.post(
       const dedupedBuffers = Array.from(uniqueByPath.values());
 
       processingLog.push(
+        makeLog(
+          "",
+          null,
+          null,
+          "export_messages_loaded_count",
+          "ok",
+          {
+            error_message: JSON.stringify({
+              requested: messageIds.length,
+              loaded: emailBundles.length,
+              missing: messageIds.length - emailBundles.length,
+              mode: resolutionMode,
+            }),
+          },
+        ),
+      );
+      processingLog.push(
         makeLog("", null, null, "export_validation_completed", bundle.validation.validation_status, {
           duration_ms: Date.now() - exportStart,
         }),
@@ -522,6 +783,12 @@ router.post(
       processingLog.push(
         makeLog("", null, null, "export_completed", "success", {
           duration_ms: Date.now() - exportStart,
+          error_message: JSON.stringify({
+            export_id: bundle.exportId,
+            email_count: bundle.manifest.email_count,
+            attachment_count: bundle.manifest.attachment_count_total,
+            mode: resolutionMode,
+          }),
         }),
       );
 
