@@ -52,6 +52,80 @@ function assertNonEmptyString(value: unknown, fieldName: string): void {
   }
 }
 
+function assertValidJsonString(value: unknown, fieldName: string): void {
+  assertNonEmptyString(value, fieldName);
+  const json = value as string;
+  if (json.trim() === "undefined") {
+    throw new Error(
+      `streamExportZip: "${fieldName}" must not be the literal token undefined.`,
+    );
+  }
+  try {
+    JSON.parse(json);
+  } catch (err) {
+    throw new Error(
+      `streamExportZip: "${fieldName}" is not valid JSON: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+}
+
+function assertValidJsonLines(value: unknown, fieldName: string): void {
+  assertNonEmptyString(value, fieldName);
+  const lines = (value as string).split("\n").filter((line) => line.length > 0);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    if (line.trim() === "undefined") {
+      throw new Error(
+        `streamExportZip: "${fieldName}" line ${i + 1} must not be undefined.`,
+      );
+    }
+    try {
+      JSON.parse(line);
+    } catch (err) {
+      throw new Error(
+        `streamExportZip: "${fieldName}" line ${i + 1} is not valid JSON: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+}
+
+function ensureJsonValidationCompletedEvent(processingLogJson: string): string {
+  const parsed = JSON.parse(processingLogJson) as unknown;
+  if (!Array.isArray(parsed)) return processingLogJson;
+  if (
+    parsed.some(
+      (entry) =>
+        entry &&
+        typeof entry === "object" &&
+        (entry as { event_type?: unknown }).event_type ===
+          "export_json_validation_completed",
+    )
+  ) {
+    return processingLogJson;
+  }
+
+  const fileValidationIndex = parsed.findIndex(
+    (entry) =>
+      entry &&
+      typeof entry === "object" &&
+      (entry as { event_type?: unknown }).event_type ===
+        "export_file_validation_completed",
+  );
+  if (fileValidationIndex === -1) return processingLogJson;
+
+  const source = parsed[fileValidationIndex];
+  if (!source || typeof source !== "object") return processingLogJson;
+  parsed.splice(fileValidationIndex + 1, 0, {
+    ...(source as Record<string, unknown>),
+    event_type: "export_json_validation_completed",
+  });
+  return JSON.stringify(parsed, null, 2);
+}
+
 /**
  * Stream the export bundle as a ZIP into the supplied writable.
  * The ZIP is rooted at `<rootDirName>/` and contains:
@@ -76,12 +150,15 @@ export async function streamExportZip(
   // String()-coerce undefined into the literal text "undefined" (the
   // original bug). The route already validates upstream, but doing this
   // here too means no future caller can re-introduce the regression.
-  assertNonEmptyString(entries.fullExportJson, "fullExportJson");
-  assertNonEmptyString(entries.aiIngestion, "aiIngestion");
-  assertNonEmptyString(entries.attachmentsIndexJson, "attachmentsIndexJson");
-  assertNonEmptyString(entries.manifestJson, "manifestJson");
-  assertNonEmptyString(entries.processingLogJson, "processingLogJson");
-  assertNonEmptyString(entries.errorsReportJson, "errorsReportJson");
+  assertValidJsonString(entries.fullExportJson, "fullExportJson");
+  assertValidJsonLines(entries.aiIngestion, "aiIngestion");
+  assertValidJsonString(entries.attachmentsIndexJson, "attachmentsIndexJson");
+  assertValidJsonString(entries.manifestJson, "manifestJson");
+  const processingLogJson = ensureJsonValidationCompletedEvent(
+    entries.processingLogJson,
+  );
+  assertValidJsonString(processingLogJson, "processingLogJson");
+  assertValidJsonString(entries.errorsReportJson, "errorsReportJson");
 
   return new Promise((resolve, reject) => {
     const archive: Archiver = archiver("zip", { zlib: { level: 6 } });
@@ -123,7 +200,7 @@ export async function streamExportZip(
     archive.append(entries.manifestJson, {
       name: `${root}/export_manifest.json`,
     });
-    archive.append(entries.processingLogJson, {
+    archive.append(processingLogJson, {
       name: `${root}/processing_log.json`,
     });
     archive.append(entries.errorsReportJson, {
