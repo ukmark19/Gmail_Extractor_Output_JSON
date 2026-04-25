@@ -33,6 +33,101 @@ export interface SerializeOptions {
   pretty?: boolean;
 }
 
+function assertJsonSafeValue(
+  value: unknown,
+  name: string,
+  path: string,
+  ancestors: WeakSet<object>,
+): void {
+  if (value === undefined) {
+    throw new SafeJsonError(
+      name,
+      `Refusing to serialize undefined value for "${name}" at ${path}.`,
+    );
+  }
+  if (typeof value === "function" || typeof value === "symbol") {
+    throw new SafeJsonError(
+      name,
+      `Refusing to serialize ${typeof value} value for "${name}" at ${path}.`,
+    );
+  }
+  if (typeof value === "bigint") {
+    throw new SafeJsonError(
+      name,
+      `Refusing to serialize bigint value for "${name}" at ${path}.`,
+    );
+  }
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    throw new SafeJsonError(
+      name,
+      `Refusing to serialize non-finite number for "${name}" at ${path}.`,
+    );
+  }
+  if (value === null) {
+    if (path === "$") {
+      throw new SafeJsonError(
+        name,
+        `Refusing to serialize null root value for "${name}".`,
+      );
+    }
+    return;
+  }
+  if (typeof value !== "object") return;
+
+  const obj = value as Record<string, unknown>;
+  if (ancestors.has(obj)) {
+    throw new SafeJsonError(
+      name,
+      `Refusing to serialize circular reference for "${name}" at ${path}.`,
+    );
+  }
+
+  ancestors.add(obj);
+  try {
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) {
+        assertJsonSafeValue(value[i], name, `${path}[${i}]`, ancestors);
+      }
+      return;
+    }
+
+    for (const key of Reflect.ownKeys(obj)) {
+      if (typeof key === "symbol") {
+        throw new SafeJsonError(
+          name,
+          `Refusing to serialize symbol-keyed property for "${name}" at ${path}.`,
+        );
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(obj, key);
+      if (!descriptor?.enumerable) continue;
+      assertJsonSafeValue(obj[key], name, `${path}.${key}`, ancestors);
+    }
+  } finally {
+    ancestors.delete(obj);
+  }
+}
+
+function assertExportManifestNotFailed(data: unknown, name: string): void {
+  if (name !== "export_manifest.json") return;
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return;
+  const manifest = data as {
+    validation_status?: unknown;
+    validation_errors?: unknown;
+  };
+  if (manifest.validation_status !== "failed") return;
+
+  const validationErrors = Array.isArray(manifest.validation_errors)
+    ? manifest.validation_errors.map((entry) => String(entry))
+    : [];
+  throw new SafeJsonError(
+    name,
+    [
+      "Export validation failed; refusing to serialize export_manifest.json.",
+      ...validationErrors,
+    ].join(" "),
+  );
+}
+
 /**
  * Serialize `data` to a JSON string, refusing to ever return the literal
  * token "undefined" or to write a value that fails a JSON.parse roundtrip.
@@ -51,6 +146,12 @@ export function serializeJsonSafe(
     throw new SafeJsonError(
       name,
       `Refusing to serialize undefined value for "${name}".`,
+    );
+  }
+  if (data === null) {
+    throw new SafeJsonError(
+      name,
+      `Refusing to serialize null root value for "${name}".`,
     );
   }
   if (opts.expect === "array" && !Array.isArray(data)) {
@@ -76,6 +177,8 @@ export function serializeJsonSafe(
       }.`,
     );
   }
+  assertJsonSafeValue(data, name, "$", new WeakSet<object>());
+  assertExportManifestNotFailed(data, name);
   let str: string | undefined;
   try {
     str = JSON.stringify(data, null, opts.pretty === false ? undefined : 2);
