@@ -21,11 +21,33 @@ import {
   type AttachmentExtractionResult,
 } from "../lib/attachment-extractor.js";
 import {
-  streamExportZip,
+  streamExportZipWithDiskTee,
   type AttachmentBufferEntry,
+  type OcrImageEntry,
 } from "../lib/export-zip.js";
+import { createReadStream, existsSync, statSync } from "node:fs";
+import { stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 const router: IRouter = Router();
+
+/**
+ * Root directory on disk where every export is persisted. Exports are scoped
+ * by user id to prevent one user from re-downloading another user's most
+ * recent export through the /api/gmail/export/latest endpoint:
+ *   exports/users/<userId>/export_<ts>/<filename>.zip   — immutable per-user copy
+ *   exports/users/<userId>/latest/latest.zip            — per-user "latest"
+ * Resolved relative to process cwd (the api-server package root in dev).
+ */
+const EXPORTS_ROOT = resolve(process.cwd(), "exports");
+
+function userExportsRoot(userId: number): string {
+  return join(EXPORTS_ROOT, "users", String(userId));
+}
+
+function userLatestZipPath(userId: number): string {
+  return join(userExportsRoot(userId), "latest", "latest.zip");
+}
 
 async function requireAuth(
   req: {
@@ -53,7 +75,31 @@ function getHeaderValue(
   );
 }
 
-// POST /api/gmail/export — streams a ZIP bundle
+function makeLog(
+  messageId: string,
+  attachmentId: string | null,
+  filename: string | null,
+  event_type: string,
+  status: string,
+  extra: Partial<ProcessingLogEntry> = {},
+): ProcessingLogEntry {
+  return {
+    timestamp: new Date().toISOString(),
+    message_id: messageId,
+    attachment_id: attachmentId,
+    filename,
+    event_type,
+    status,
+    extraction_method: null,
+    duration_ms: null,
+    error_category: null,
+    error_message: null,
+    user_action_needed: null,
+    ...extra,
+  };
+}
+
+// POST /api/gmail/export — streams a ZIP bundle (and persists to disk)
 router.post(
   "/gmail/export",
   requireAuth as unknown as (req: unknown, res: unknown, next: () => void) => Promise<void>,
@@ -107,7 +153,10 @@ router.post(
         email: EmailData;
         attachments: AttachmentExtractionResult[];
       }> = [];
+      // Buffers indexed by their PRE-DEDUP storage_path. We filter against
+      // bundle.keepStoragePaths after dedup before streaming.
       const attachmentBuffers: AttachmentBufferEntry[] = [];
+      const ocrImages: OcrImageEntry[] = [];
 
       let totalAttachmentsDetected = 0;
       let totalAttachmentsExtracted = 0;
@@ -123,19 +172,9 @@ router.post(
 
       for (const messageId of messageIds) {
         const fetchStart = Date.now();
-        processingLog.push({
-          timestamp: new Date().toISOString(),
-          message_id: messageId,
-          attachment_id: null,
-          filename: null,
-          event_type: "email_fetch_started",
-          status: "pending",
-          extraction_method: null,
-          duration_ms: null,
-          error_category: null,
-          error_message: null,
-          user_action_needed: null,
-        });
+        processingLog.push(
+          makeLog(messageId, null, null, "email_fetch_started", "pending"),
+        );
 
         try {
           const detail = await gmail.users.messages.get({
@@ -219,19 +258,11 @@ router.post(
             bodyErrors,
           };
 
-          processingLog.push({
-            timestamp: new Date().toISOString(),
-            message_id: messageId,
-            attachment_id: null,
-            filename: null,
-            event_type: "email_fetch_completed",
-            status: "success",
-            extraction_method: null,
-            duration_ms: Date.now() - fetchStart,
-            error_category: null,
-            error_message: null,
-            user_action_needed: null,
-          });
+          processingLog.push(
+            makeLog(messageId, null, null, "email_fetch_completed", "success", {
+              duration_ms: Date.now() - fetchStart,
+            }),
+          );
 
           // Extract attachment metadata from parts recursively
           const rawAttachmentParts = collectAttachmentParts(parts);
@@ -257,25 +288,37 @@ router.post(
           }
 
           processingLog.push(
-            ...rawAttachmentParts.map((p) => ({
-              timestamp: new Date().toISOString(),
-              message_id: messageId,
-              attachment_id: p.body?.attachmentId || null,
-              filename: p.filename || null,
-              event_type: "attachment_detected",
-              status: "detected",
-              extraction_method: null as null,
-              duration_ms: null as null,
-              error_category: null as null,
-              error_message: null as null,
-              user_action_needed: null as null,
-            })),
+            ...rawAttachmentParts.map((p) =>
+              makeLog(
+                messageId,
+                p.body?.attachmentId || null,
+                p.filename || null,
+                "attachment_detected",
+                "detected",
+              ),
+            ),
           );
 
           // Extract content from each attachment
           const attachments: AttachmentExtractionResult[] = [];
           for (let idx = 0; idx < rawAttachmentParts.length; idx++) {
             const part = rawAttachmentParts[idx];
+            const isPdf =
+              (part.mimeType || "").toLowerCase() === "application/pdf";
+
+            if (isPdf) {
+              processingLog.push(
+                makeLog(
+                  messageId,
+                  part.body?.attachmentId || null,
+                  part.filename || null,
+                  "pdf_security_analysis_started",
+                  "pending",
+                  { extraction_method: "pdf_parser" },
+                ),
+              );
+            }
+
             const extracted = await extractAttachmentContent(
               gmail,
               messageId,
@@ -283,6 +326,81 @@ router.post(
               processingLog,
             );
             const result = extracted.result;
+
+            if (isPdf) {
+              processingLog.push(
+                makeLog(
+                  messageId,
+                  result.attachment_id,
+                  result.filename,
+                  "pdf_security_analysis_completed",
+                  result.is_encrypted ? "encrypted" : "clear",
+                  {
+                    extraction_method: "pdf_parser",
+                  },
+                ),
+              );
+            }
+
+            // Synthesize per-stage events from the result + presence of OCR
+            // page images so the processing_log surfaces the new stages
+            // without requiring extractor-internal changes per call site.
+            if (result.fallback_method === "pdf_to_images" || result.extraction_method === "ocr" || result.extraction_method === "pdf_parser+ocr") {
+              processingLog.push(
+                makeLog(
+                  messageId,
+                  result.attachment_id,
+                  result.filename,
+                  "pdf_to_images_started",
+                  "pending",
+                ),
+              );
+              processingLog.push(
+                makeLog(
+                  messageId,
+                  result.attachment_id,
+                  result.filename,
+                  "pdf_to_images_completed",
+                  result.failure_category === "ocr_not_configured"
+                    ? "not_configured"
+                    : extracted.ocrPageImages && extracted.ocrPageImages.length > 0
+                      ? "success"
+                      : "failed",
+                ),
+              );
+            }
+            if (
+              result.extraction_method === "ocr" ||
+              result.extraction_method === "pdf_parser+ocr"
+            ) {
+              processingLog.push(
+                makeLog(
+                  messageId,
+                  result.attachment_id,
+                  result.filename,
+                  "ocr_started",
+                  "pending",
+                  { extraction_method: "ocr" },
+                ),
+              );
+              processingLog.push(
+                makeLog(
+                  messageId,
+                  result.attachment_id,
+                  result.filename,
+                  "ocr_completed",
+                  result.extraction_status === "success" ||
+                    result.extraction_status === "partial"
+                    ? "success"
+                    : "failed",
+                  {
+                    extraction_method: "ocr",
+                    error_category: result.failure_category,
+                  },
+                ),
+              );
+            }
+
             // Pick the bytes that will actually live in the ZIP and derive the
             // sha256 used in the storage path from those exact bytes so the
             // filename's sha8 is always consistent with the stored payload.
@@ -313,6 +431,20 @@ router.post(
                 result.safe_filename,
               );
             }
+
+            // Surface OCR page PNGs into the export ZIP under
+            // ocr_images/<msgId>/<attId>/page_<n>.png
+            if (extracted.ocrPageImages && extracted.ocrPageImages.length > 0) {
+              for (const p of extracted.ocrPageImages) {
+                ocrImages.push({
+                  messageId,
+                  attachmentId: result.attachment_id,
+                  pageNumber: p.pageNumber,
+                  png: p.png,
+                });
+              }
+            }
+
             attachments.push(result);
             req.log.info(
               {
@@ -337,37 +469,23 @@ router.post(
               totalAttachmentsUnsupported++;
           }
 
-          processingLog.push({
-            timestamp: new Date().toISOString(),
-            message_id: messageId,
-            attachment_id: null,
-            filename: null,
-            event_type: "export_record_written",
-            status: "success",
-            extraction_method: null,
-            duration_ms: Date.now() - fetchStart,
-            error_category: null,
-            error_message: null,
-            user_action_needed: null,
-          });
+          processingLog.push(
+            makeLog(messageId, null, null, "export_record_written", "success", {
+              duration_ms: Date.now() - fetchStart,
+            }),
+          );
 
           emailBundles.push({ email, attachments });
         } catch (err) {
           const errMsg = err instanceof Error ? err.message : String(err);
           req.log.warn(`Failed to fetch message ${messageId} for export: ${errMsg}`);
-          processingLog.push({
-            timestamp: new Date().toISOString(),
-            message_id: messageId,
-            attachment_id: null,
-            filename: null,
-            event_type: "email_fetch_completed",
-            status: "failed",
-            extraction_method: null,
-            duration_ms: Date.now() - fetchStart,
-            error_category: "unknown_error" as const,
-            error_message: errMsg,
-            user_action_needed: null,
-          });
+          processingLog.push(
+            makeLog(messageId, null, null, "email_fetch_completed", "failed", {
+              duration_ms: Date.now() - fetchStart,
+              error_category: "unknown_error",
+              error_message: errMsg,
+            }),
+          );
         }
       }
 
@@ -384,19 +502,28 @@ router.post(
         processingLog,
       );
 
-      processingLog.push({
-        timestamp: new Date().toISOString(),
-        message_id: "",
-        attachment_id: null,
-        filename: null,
-        event_type: "export_completed",
-        status: "success",
-        extraction_method: null,
-        duration_ms: Date.now() - exportStart,
-        error_category: null,
-        error_message: null,
-        user_action_needed: null,
-      });
+      // After dedup, only keep buffers whose storage_path survived. The first
+      // occurrence of any (sha256) wins; later occurrences had their
+      // storage_path collapsed onto the first by the bundle builder.
+      const uniqueByPath = new Map<string, AttachmentBufferEntry>();
+      for (const b of attachmentBuffers) {
+        if (!bundle.keepStoragePaths.has(b.storagePath)) continue;
+        if (!uniqueByPath.has(b.storagePath)) {
+          uniqueByPath.set(b.storagePath, b);
+        }
+      }
+      const dedupedBuffers = Array.from(uniqueByPath.values());
+
+      processingLog.push(
+        makeLog("", null, null, "export_validation_completed", bundle.validation.validation_status, {
+          duration_ms: Date.now() - exportStart,
+        }),
+      );
+      processingLog.push(
+        makeLog("", null, null, "export_completed", "success", {
+          duration_ms: Date.now() - exportStart,
+        }),
+      );
 
       // Final structured console summary
       const m = bundle.manifest;
@@ -412,12 +539,14 @@ router.post(
         attachments_partial: m.attachment_partial_count,
         attachments_failed: m.attachment_failure_count,
         attachments_skipped: m.attachment_skipped_count,
+        duplicate_attachments: m.duplicate_attachments_count,
+        ocr_pages: ocrImages.length,
         emails_with_has_attachment_label: totalEmailsWithLabel,
         validation_status: bundle.validation.validation_status,
         validation_errors: bundle.validation.validation_errors.length,
         validation_warnings: bundle.validation.validation_warnings.length,
         failure_breakdown: m.failure_breakdown,
-        bundle_files: 5 + attachmentBuffers.length,
+        bundle_files: 6 + dedupedBuffers.length + ocrImages.length,
         duration_ms: Date.now() - exportStart,
       });
 
@@ -437,7 +566,7 @@ router.post(
         );
       }
 
-      // Stream the ZIP response
+      // Stream the ZIP response (and tee to disk)
       const ts = new Date()
         .toISOString()
         .replace(/[:.]/g, "-")
@@ -471,6 +600,10 @@ router.post(
         String(m.attachment_unsupported_count),
       );
       res.setHeader(
+        "X-Export-Attachment-Duplicate",
+        String(m.duplicate_attachments_count),
+      );
+      res.setHeader(
         "X-Export-Validation",
         bundle.validation.validation_status,
       );
@@ -484,18 +617,40 @@ router.post(
           "X-Export-Attachment-Success",
           "X-Export-Attachment-Failed",
           "X-Export-Attachment-Unsupported",
+          "X-Export-Attachment-Duplicate",
           "X-Export-Validation",
         ].join(", "),
       );
 
       try {
-        await streamExportZip(bundle, attachmentBuffers, rootDir, res);
+        const persistResult = await streamExportZipWithDiskTee(
+          bundle,
+          dedupedBuffers,
+          rootDir,
+          res,
+          ocrImages,
+          bundle.errorsReport,
+          {
+            // Per-user root: prevents cross-user PII leakage via the
+            // /api/gmail/export/latest endpoint.
+            exportsRoot: userExportsRoot(session.userId!),
+            exportTimestamp: ts,
+            zipFilename,
+          },
+        );
+        // After-the-fact log so the saved processing_log inside this run does
+        // NOT contain the entry (it's already streamed); but we do print it
+        // for ops visibility.
         req.log.info(
           {
             export_id: bundle.exportId,
-            attachment_files: attachmentBuffers.length,
+            attachment_files: dedupedBuffers.length,
+            ocr_images: ocrImages.length,
+            timestamped_path: persistResult.timestampedPath,
+            latest_path: persistResult.latestPath,
+            bytes_written: persistResult.bytesWritten,
           },
-          "[export] zip stream completed",
+          "[export] zip stream + disk persist completed",
         );
       } catch (zipErr) {
         req.log.error({ err: zipErr }, "[export] zip stream failed");
@@ -509,6 +664,93 @@ router.post(
       } else {
         res.destroy(err as Error);
       }
+    }
+  },
+);
+
+// GET /api/gmail/export/latest — re-download the most recent export.
+// Auth required so we don't leak somebody else's export to anonymous callers.
+router.get(
+  "/gmail/export/latest",
+  requireAuth as unknown as (req: unknown, res: unknown, next: () => void) => Promise<void>,
+  async (req, res): Promise<void> => {
+    const session = req.session as { userId?: number };
+    if (!session.userId) {
+      res.status(401).json({ error: "Not authenticated" });
+      return;
+    }
+    // Resolve to the requester's own latest.zip — never another user's.
+    const latestPath = userLatestZipPath(session.userId);
+    if (!existsSync(latestPath)) {
+      res.status(404).json({ error: "No export has been generated yet" });
+      return;
+    }
+    try {
+      const st = await stat(latestPath);
+      const tsStr = new Date(st.mtimeMs)
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .slice(0, 19);
+      const filename = `gmail-export-latest-${tsStr}.zip`;
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`,
+      );
+      res.setHeader("Content-Length", String(st.size));
+      res.setHeader("X-Export-Latest-Mtime", new Date(st.mtimeMs).toISOString());
+      res.setHeader(
+        "Access-Control-Expose-Headers",
+        ["Content-Disposition", "X-Export-Latest-Mtime"].join(", "),
+      );
+      const stream = createReadStream(latestPath);
+      stream.on("error", (err) => {
+        if (!res.headersSent) {
+          res.status(500).json({ error: "Failed to read latest export" });
+        } else {
+          res.destroy(err);
+        }
+      });
+      stream.pipe(res);
+    } catch (err) {
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Failed to serve latest export",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+  },
+);
+
+// HEAD /api/gmail/export/latest — lightweight existence check used by the UI
+// to decide whether to enable the "Download Latest" button.
+router.head(
+  "/gmail/export/latest",
+  requireAuth as unknown as (req: unknown, res: unknown, next: () => void) => Promise<void>,
+  async (req, res): Promise<void> => {
+    const session = req.session as { userId?: number };
+    if (!session.userId) {
+      res.status(401).end();
+      return;
+    }
+    const latestPath = userLatestZipPath(session.userId);
+    if (!existsSync(latestPath)) {
+      res.status(404).end();
+      return;
+    }
+    try {
+      const st = statSync(latestPath);
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Length", String(st.size));
+      res.setHeader("X-Export-Latest-Mtime", new Date(st.mtimeMs).toISOString());
+      res.setHeader(
+        "Access-Control-Expose-Headers",
+        "X-Export-Latest-Mtime",
+      );
+      res.status(200).end();
+    } catch {
+      res.status(404).end();
     }
   },
 );

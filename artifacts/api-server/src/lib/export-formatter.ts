@@ -128,6 +128,13 @@ export interface AiIngestionRecord {
     page_count: number | null;
   }>;
   attachment_text_blocks: Array<{
+    /**
+     * Discriminator: `attachment_text` for real extracted text;
+     * `attachment_failure_notice` for synthetic notices on attachments that
+     * yielded no text (failed/unsupported/skipped). Notices preserve the
+     * fact that an attachment exists for the downstream LLM.
+     */
+    block_type: "attachment_text" | "attachment_failure_notice";
     attachment_id: string;
     filename: string;
     storage_path: string;
@@ -168,13 +175,19 @@ export interface DetailedManifest {
   attachment_partial_count: number;
   attachment_failure_count: number;
   attachment_skipped_count: number;
+  /**
+   * Number of attachments whose bytes were byte-identical (same sha256) to
+   * an earlier attachment in this export. Their buffer is not stored a
+   * second time; their index entry carries `duplicate_of`.
+   */
+  duplicate_attachments_count: number;
   failure_breakdown: {
     encrypted_or_password_protected: number;
     corrupt_or_malformed: number;
     unsupported_file_type: number;
     too_large: number;
     ocr_failed: number;
-    ocr_unavailable: number;
+    ocr_not_configured: number;
     environment_error: number;
     parser_error: number;
     network_fetch_error: number;
@@ -412,7 +425,16 @@ export function formatAiIngestionRecord(
     page_count: a.page_count,
   }));
 
-  const blocks = attachments
+  type AttachmentTextBlock = {
+    block_type: "attachment_text" | "attachment_failure_notice";
+    attachment_id: string;
+    filename: string;
+    storage_path: string;
+    mime_type: string;
+    page_count: number | null;
+    text: string;
+  };
+  const blocks: AttachmentTextBlock[] = attachments
     .filter(
       (a) =>
         a.extracted_text &&
@@ -420,6 +442,7 @@ export function formatAiIngestionRecord(
           a.extraction_status === "partial"),
     )
     .map((a) => ({
+      block_type: "attachment_text" as const,
       attachment_id: a.attachment_id,
       filename: a.filename,
       storage_path: a.storage_path,
@@ -427,6 +450,48 @@ export function formatAiIngestionRecord(
       page_count: a.page_count,
       text: a.extracted_text!,
     }));
+
+  // For every attachment that did NOT yield text, emit a synthetic
+  // "attachment_failure_notice" text block so the downstream LLM still sees
+  // an explicit signal that the attachment exists and why it has no content.
+  // The notice prose is human-readable and tells the LLM what happened.
+  for (const a of attachments) {
+    const isFailure =
+      a.extraction_status === "failed" ||
+      a.extraction_status === "unsupported" ||
+      a.extraction_status === "skipped" ||
+      ((a.extraction_status === "success" || a.extraction_status === "partial") &&
+        !a.extracted_text);
+    if (!isFailure) continue;
+    const reason =
+      a.failure_detail ||
+      a.skip_reason ||
+      (a.extraction_status === "unsupported"
+        ? `Unsupported file type: ${a.mime_type}`
+        : "No text could be extracted from this attachment.");
+    const action = a.user_action_needed
+      ? `\nSuggested user action: ${a.user_action_needed}`
+      : "";
+    const noticeText = [
+      "ATTACHMENT FAILURE NOTICE",
+      `Filename: ${a.filename}`,
+      `MIME type: ${a.mime_type}`,
+      `Status: ${a.extraction_status}`,
+      `Failure category: ${a.failure_category ?? "n/a"}`,
+      `Reason: ${reason}${action}`,
+      "",
+      "No textual content was extracted from this attachment, so it cannot be summarised or quoted. The original bytes (if downloaded) are available at the storage_path above.",
+    ].join("\n");
+    blocks.push({
+      block_type: "attachment_failure_notice" as const,
+      attachment_id: a.attachment_id,
+      filename: a.filename,
+      storage_path: a.storage_path,
+      mime_type: a.mime_type,
+      page_count: a.page_count,
+      text: noticeText,
+    });
+  }
 
   return {
     document_id: `gmail_${email.id}`,
@@ -486,12 +551,13 @@ export function buildDetailedManifest(
     unsupported_file_type: 0,
     too_large: 0,
     ocr_failed: 0,
-    ocr_unavailable: 0,
+    ocr_not_configured: 0,
     environment_error: 0,
     parser_error: 0,
     network_fetch_error: 0,
     unknown_error: 0,
   };
+  let duplicateCount = 0;
   const emailsWithErrors: string[] = [];
   const attachmentsRequiringAction: DetailedManifest["attachments_requiring_user_action"] =
     [];
@@ -507,6 +573,7 @@ export function buildDetailedManifest(
       // Single source of truth: is_supported decides supported vs unsupported buckets.
       if (att.is_supported) attachmentSupported++;
       else attachmentUnsupported++;
+      if (att.duplicate_of) duplicateCount++;
 
       // Status buckets are independent of supported/unsupported (no double-counting).
       switch (att.extraction_status) {
@@ -565,6 +632,7 @@ export function buildDetailedManifest(
     attachment_partial_count: attachmentPartial,
     attachment_failure_count: attachmentFailed,
     attachment_skipped_count: attachmentSkipped,
+    duplicate_attachments_count: duplicateCount,
     failure_breakdown: failureBreakdown,
     emails_with_any_errors: emailsWithErrors,
     attachments_requiring_user_action: attachmentsRequiringAction,
@@ -573,6 +641,21 @@ export function buildDetailedManifest(
     validation_warnings: validation.validation_warnings,
   };
 }
+
+export type ExtractionStatusLabel =
+  | "success"
+  | "partial"
+  | "failed"
+  | "unsupported"
+  | "skipped";
+
+export type DownloadStatus = "not_required" | "pending" | "success" | "failed";
+export type PipelineStageStatus =
+  | "not_attempted"
+  | "success"
+  | "failed"
+  | "skipped"
+  | "not_configured";
 
 export interface AttachmentIndexEntry {
   attachment_id: string;
@@ -591,7 +674,15 @@ export interface AttachmentIndexEntry {
   original_sha256: string | null;
   processed_sha256: string | null;
   storage_path: string;
+  /**
+   * If this attachment's bytes are byte-identical (same sha256) to an
+   * earlier attachment in the same export, this is the storage_path of the
+   * first occurrence; the buffer for this entry is NOT stored a second time.
+   */
+  duplicate_of: string | null;
   was_downloaded: boolean;
+  /** Spec-mandated coarse status for the bytes-fetch stage. */
+  download_status: DownloadStatus;
   is_embedded: boolean;
   is_inline: boolean;
   attachment_role: string;
@@ -609,15 +700,213 @@ export interface AttachmentIndexEntry {
   security_removed: boolean;
   security_removal_method: string;
   security_removal_error: string | null;
+  /** PDF-unlock pipeline stage (qpdf decryption). */
+  pdf_unlock_attempted: boolean;
+  pdf_unlock_status: PipelineStageStatus;
+  /** PDF-to-images rasterisation stage (poppler/pdftoppm). */
+  pdf_to_images_attempted: boolean;
+  pdf_to_images_status: PipelineStageStatus;
+  /** OCR stage (tesseract). */
+  ocr_attempted: boolean;
+  ocr_status: PipelineStageStatus;
+  /**
+   * Final coarse status: whether ANY text was usefully extracted, regardless
+   * of which pipeline stage produced it. Mirrors parse_status but normalised
+   * for downstream consumers.
+   */
+  final_extraction_status: ExtractionStatusLabel;
   text_summary: string;
 }
 
-export type ExtractionStatusLabel =
-  | "success"
-  | "partial"
-  | "failed"
-  | "unsupported"
-  | "skipped";
+/**
+ * Map an AttachmentExtractionResult to the spec-mandated coarse
+ * download_status: not_required (skipped before download), pending (we
+ * intended to but never did), success, or failed.
+ */
+export function deriveDownloadStatus(
+  att: AttachmentExtractionResult,
+): DownloadStatus {
+  if (att.was_downloaded) return "success";
+  if (att.extraction_status === "skipped") return "not_required";
+  if (att.extraction_status === "unsupported") return "not_required";
+  if (att.extraction_status === "failed") return "failed";
+  return "pending";
+}
+
+/**
+ * Decide the PDF-unlock pipeline status by inspecting whether unlock was
+ * attempted and the qpdf-driven unlock_status / security_removed signals.
+ */
+export function derivePdfUnlockStage(att: AttachmentExtractionResult): {
+  attempted: boolean;
+  status: PipelineStageStatus;
+} {
+  if (!att.unlock_attempted) {
+    return { attempted: false, status: "not_attempted" };
+  }
+  if (att.security_removed || att.unlock_status === "success") {
+    return { attempted: true, status: "success" };
+  }
+  if (att.unlock_status === "failed") {
+    return { attempted: true, status: "failed" };
+  }
+  if (att.unlock_status === "skipped") {
+    return { attempted: true, status: "skipped" };
+  }
+  return { attempted: true, status: "failed" };
+}
+
+/**
+ * Decide the PDF-to-images rasterisation pipeline status from the
+ * fallback_method / extraction_method signals on the result.
+ */
+export function derivePdfToImagesStage(att: AttachmentExtractionResult): {
+  attempted: boolean;
+  status: PipelineStageStatus;
+} {
+  // The extractor only sets fallback_method to "pdf_to_images" or "ocr"
+  // (which itself rasterises via pdftoppm) when it actually went down the
+  // image path.
+  const wentToImages =
+    att.fallback_method === "pdf_to_images" ||
+    att.fallback_method === "ocr" ||
+    att.extraction_method === "ocr" ||
+    att.extraction_method === "pdf_parser+ocr";
+  if (!wentToImages) {
+    return { attempted: false, status: "not_attempted" };
+  }
+  if (att.failure_category === "ocr_not_configured") {
+    return { attempted: true, status: "not_configured" };
+  }
+  if (att.fallback_used) {
+    return { attempted: true, status: "success" };
+  }
+  return { attempted: true, status: "failed" };
+}
+
+/**
+ * Decide the OCR pipeline status from extraction_method / failure_category.
+ */
+export function deriveOcrStage(att: AttachmentExtractionResult): {
+  attempted: boolean;
+  status: PipelineStageStatus;
+} {
+  const isImage = att.mime_type.startsWith("image/");
+  const usedOcr =
+    att.extraction_method === "ocr" ||
+    att.extraction_method === "pdf_parser+ocr";
+  if (att.failure_category === "ocr_not_configured") {
+    return { attempted: true, status: "not_configured" };
+  }
+  if (!usedOcr && !isImage) {
+    return { attempted: false, status: "not_attempted" };
+  }
+  if (!usedOcr && isImage) {
+    // Image attachment but OCR was not run — treat as not attempted.
+    return { attempted: false, status: "not_attempted" };
+  }
+  if (
+    att.extraction_status === "success" ||
+    att.extraction_status === "partial"
+  ) {
+    return { attempted: true, status: "success" };
+  }
+  return { attempted: true, status: "failed" };
+}
+
+/**
+ * Walk all attachments across all emails, collapse byte-identical bytes
+ * (same sha256) onto the FIRST occurrence's storage_path, and mark every
+ * later occurrence with `duplicate_of`. Mutates the result records in-place
+ * for simplicity (they are owned by the caller). Returns the set of
+ * storage_paths that should actually be written into the ZIP.
+ */
+export function deduplicateAttachmentsBySha256(
+  emails: Array<{ email: EmailData; attachments: AttachmentExtractionResult[] }>,
+): { keepPaths: Set<string> } {
+  const firstSeen = new Map<string, string>(); // sha256 -> storage_path of first occurrence
+  const keepPaths = new Set<string>();
+  for (const { attachments } of emails) {
+    for (const att of attachments) {
+      if (!att.was_downloaded || !att.sha256) continue;
+      const seen = firstSeen.get(att.sha256);
+      if (!seen) {
+        firstSeen.set(att.sha256, att.storage_path);
+        keepPaths.add(att.storage_path);
+      } else {
+        // duplicate — collapse onto the first occurrence's storage_path.
+        att.duplicate_of = seen;
+        att.storage_path = seen;
+      }
+    }
+  }
+  return { keepPaths };
+}
+
+/**
+ * Build the standalone errors_report.json payload — one entry per attachment
+ * that ended up failed/unsupported/skipped, grouped by failure category.
+ * Consumers (humans + LLMs) use this as the single place to look for
+ * "what went wrong".
+ */
+export interface ErrorsReportEntry {
+  message_id: string;
+  attachment_id: string;
+  filename: string;
+  mime_type: string;
+  category: string;
+  status: ExtractionStatusLabel;
+  detail: string | null;
+  user_action_needed: string | null;
+  storage_path: string;
+}
+
+export interface ErrorsReportGroup {
+  category: string;
+  count: number;
+  entries: ErrorsReportEntry[];
+}
+
+export function buildErrorsReport(
+  emails: Array<{ email: EmailData; attachments: AttachmentExtractionResult[] }>,
+): ErrorsReportGroup[] {
+  const groups = new Map<string, ErrorsReportEntry[]>();
+  for (const { email, attachments } of emails) {
+    for (const att of attachments) {
+      const isProblem =
+        att.extraction_status === "failed" ||
+        att.extraction_status === "unsupported" ||
+        att.extraction_status === "skipped";
+      if (!isProblem) continue;
+      const category =
+        att.failure_category ??
+        (att.extraction_status === "unsupported"
+          ? "unsupported_file_type"
+          : att.extraction_status === "skipped"
+            ? "skipped"
+            : "unknown_error");
+      const entry: ErrorsReportEntry = {
+        message_id: email.id,
+        attachment_id: att.attachment_id,
+        filename: att.filename,
+        mime_type: att.mime_type,
+        category,
+        status: att.extraction_status,
+        detail: att.failure_detail ?? att.skip_reason ?? null,
+        user_action_needed: att.user_action_needed,
+        storage_path: att.storage_path,
+      };
+      const arr = groups.get(category);
+      if (arr) arr.push(entry);
+      else groups.set(category, [entry]);
+    }
+  }
+  return Array.from(groups.entries()).map(([category, entries]) => ({
+    category,
+    count: entries.length,
+    entries,
+  }));
+}
 
 function summarizeText(text: string | null, maxChars = 240): string {
   if (!text) return "";
@@ -631,6 +920,9 @@ export function buildAttachmentsIndex(
   const out: AttachmentIndexEntry[] = [];
   for (const { email, attachments } of emails) {
     for (const att of attachments) {
+      const unlock = derivePdfUnlockStage(att);
+      const toImages = derivePdfToImagesStage(att);
+      const ocr = deriveOcrStage(att);
       out.push({
         attachment_id: att.attachment_id,
         parent_document_id: att.parent_document_id,
@@ -648,7 +940,9 @@ export function buildAttachmentsIndex(
         original_sha256: att.original_sha256,
         processed_sha256: att.processed_sha256,
         storage_path: att.storage_path,
+        duplicate_of: att.duplicate_of,
         was_downloaded: att.was_downloaded,
+        download_status: deriveDownloadStatus(att),
         is_embedded: att.is_embedded,
         is_inline: att.is_inline,
         attachment_role: att.attachment_role,
@@ -666,6 +960,13 @@ export function buildAttachmentsIndex(
         security_removed: att.security_removed,
         security_removal_method: att.security_removal_method,
         security_removal_error: att.security_removal_error,
+        pdf_unlock_attempted: unlock.attempted,
+        pdf_unlock_status: unlock.status,
+        pdf_to_images_attempted: toImages.attempted,
+        pdf_to_images_status: toImages.status,
+        ocr_attempted: ocr.attempted,
+        ocr_status: ocr.status,
+        final_extraction_status: att.extraction_status,
         text_summary: summarizeText(att.extracted_text),
       });
     }
@@ -720,10 +1021,13 @@ export function validateExportBundle(
     }
   }
 
-  // 3. every storage_path is unique
+  // 3. every storage_path is unique among NON-duplicate, downloaded entries.
+  //    Duplicate entries deliberately point at the original's storage_path —
+  //    that is the contract for sha256 dedup.
   const seenPaths = new Set<string>();
   for (const e of attachmentsIndex) {
     if (!e.was_downloaded) continue;
+    if (e.duplicate_of) continue;
     if (seenPaths.has(e.storage_path)) {
       errors.push(`duplicate storage_path: ${e.storage_path}`);
     }
@@ -731,9 +1035,11 @@ export function validateExportBundle(
   }
 
   // 4. no duplicate filename collision under same message_id at same path
+  //    (duplicates are again excluded — they share a path with their original).
   const perMsg = new Map<string, Map<string, number>>();
   for (const e of attachmentsIndex) {
     if (!e.was_downloaded) continue;
+    if (e.duplicate_of) continue;
     let inner = perMsg.get(e.parent_message_id);
     if (!inner) {
       inner = new Map();
@@ -747,6 +1053,20 @@ export function validateExportBundle(
       if (count > 1) {
         errors.push(`duplicate file in message ${msg}: ${path} (×${count})`);
       }
+    }
+  }
+
+  // 4b. every duplicate_of points at a real storage_path that exists in the
+  //     index as a non-duplicate entry.
+  const allRealPaths = new Set<string>();
+  for (const e of attachmentsIndex) {
+    if (!e.duplicate_of) allRealPaths.add(e.storage_path);
+  }
+  for (const e of attachmentsIndex) {
+    if (e.duplicate_of && !allRealPaths.has(e.duplicate_of)) {
+      errors.push(
+        `attachment ${e.filename} (${e.attachment_id}) marked duplicate_of=${e.duplicate_of} but no original entry has that storage_path`,
+      );
     }
   }
 
@@ -832,6 +1152,13 @@ export interface ExportBundle {
   manifest: DetailedManifest;
   processingLog: ProcessingLogEntry[];
   validation: ValidationReport;
+  errorsReport: ErrorsReportGroup[];
+  /**
+   * The set of storage_paths that should actually be written into the ZIP
+   * (after sha256-dedup collapses duplicates onto the first occurrence).
+   * Callers should filter their attachment buffer list against this set.
+   */
+  keepStoragePaths: Set<string>;
 }
 
 export function buildExportBundle(
@@ -842,6 +1169,11 @@ export function buildExportBundle(
   const exportId = uuidv4();
   const exportedAt = new Date().toISOString();
 
+  // CRITICAL: dedup by sha256 BEFORE building any of the downstream artifacts
+  // so storage_paths in full_export, ai_ingestion, attachments_index, and
+  // manifest are all consistent (duplicates point at the first occurrence).
+  const { keepPaths } = deduplicateAttachmentsBySha256(emails);
+
   const fullExport = emails.map(({ email, attachments }) =>
     formatFullExport(email, attachments, queryContext, exportedAt),
   );
@@ -850,6 +1182,7 @@ export function buildExportBundle(
   );
   const aiIngestion = aiLines.join("\n");
   const attachmentsIndex = buildAttachmentsIndex(emails);
+  const errorsReport = buildErrorsReport(emails);
 
   // Two-phase: build a tentative manifest for count fields, then validate, then re-emit final manifest
   const tentativeCounts = computeManifestCountsOnly(emails);
@@ -877,6 +1210,8 @@ export function buildExportBundle(
     manifest,
     processingLog,
     validation,
+    errorsReport,
+    keepStoragePaths: keepPaths,
   };
 }
 

@@ -205,6 +205,7 @@ async function ocrPdfPages(
   pagesProcessed: number;
   pagesTotal: number | null;
   error: string | null;
+  pageImages: Array<{ pageNumber: number; png: Buffer }>;
 }> {
   const deps = getDependencyReport();
   if (!deps?.pdftoppm.available) {
@@ -213,6 +214,7 @@ async function ocrPdfPages(
       pagesProcessed: 0,
       pagesTotal: null,
       error: "pdftoppm (poppler-utils) not installed — cannot rasterize for OCR",
+      pageImages: [],
     };
   }
   const tmpDir = await mkdtemp(join(tmpdir(), "pdf-ocr-"));
@@ -261,9 +263,13 @@ async function ocrPdfPages(
     ).recognize;
 
     const pages: PageRecord[] = [];
+    const pageImages: Array<{ pageNumber: number; png: Buffer }> = [];
     for (let i = 0; i < files.length; i++) {
       const pngPath = join(tmpDir, files[i]);
       const pngBuf = await readFile(pngPath);
+      // Surface the rasterised page so the route can include it under
+      // ocr_images/<msg>/<att>/page_<n>.png in the export ZIP.
+      pageImages.push({ pageNumber: i + 1, png: pngBuf });
       try {
         const result = await recognize(pngBuf, "eng");
         const pageText = (result.data.text || "").trim();
@@ -301,6 +307,7 @@ async function ocrPdfPages(
       pagesProcessed: files.length,
       pagesTotal: pageCount,
       error: null,
+      pageImages,
     };
   } catch (err) {
     return {
@@ -308,6 +315,7 @@ async function ocrPdfPages(
       pagesProcessed: 0,
       pagesTotal: null,
       error: err instanceof Error ? err.message : String(err),
+      pageImages: [],
     };
   } finally {
     await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
@@ -335,7 +343,9 @@ export type FailureCategory =
   | "extraction_timeout"
   | "parser_error"
   | "ocr_failed"
-  | "ocr_unavailable"
+  // ocr_not_configured is emitted when OCR is required but disabled
+  // or when the system OCR pipeline (pdftoppm) is unavailable.
+  | "ocr_not_configured"
   | "environment_error"
   | "network_fetch_error"
   | "permission_error"
@@ -443,6 +453,10 @@ export interface AttachmentExtractionResult {
   structured_data: Record<string, unknown> | null;
   // EML
   child_emails: ChildEmailRecord[] | null;
+  // Deduplication: when this attachment's bytes are byte-identical (same
+  // sha256) to an earlier attachment in the same export, this points at the
+  // first attachment's storage_path. The buffer is NOT re-stored.
+  duplicate_of: string | null;
   warnings: string[];
   errors: string[];
 }
@@ -467,6 +481,12 @@ export interface ExtractedAttachment {
   buffer: Buffer | null;
   /** processed (e.g. qpdf-decrypted) bytes — only set when security_removed=true */
   processedBuffer: Buffer | null;
+  /**
+   * PNG buffers of pages rasterised for OCR. Surfaced into the ZIP under
+   * ocr_images/<messageId>/<attachmentId>/page_<n>.png so users can audit
+   * exactly what was OCR'd. Null when no rasterisation occurred.
+   */
+  ocrPageImages?: Array<{ pageNumber: number; png: Buffer }> | null;
 }
 
 const MAX_ATTACHMENT_SIZE = 25 * 1024 * 1024; // 25 MB
@@ -659,6 +679,7 @@ function makeBaseResult(
     pages_extracted_count: null,
     pages_failed_count: null,
     child_emails: null,
+    duplicate_of: null,
     warnings: [],
     errors: [],
   };
@@ -701,7 +722,7 @@ export async function extractAttachmentContent(
   const parentDocumentId = `gmail_${messageId}`;
   // Storage path is finalised by the caller after sha256 is known,
   // but we set a sensible default here so the result is internally valid.
-  const storagePath = `attachments/${messageId}/${safeFilename}`;
+  const storagePath = `extracted_attachments/${messageId}/${safeFilename}`;
 
   const defaults: ResultDefaults = {
     attachmentId,
@@ -1650,7 +1671,7 @@ export async function extractAttachmentContent(
               startTime,
               {
                 extraction_method: "ocr",
-                error_category: "ocr_unavailable",
+                error_category: "ocr_not_configured",
                 error_message: "pdftoppm missing on server",
                 user_action_needed: userAction,
               },
@@ -1664,7 +1685,7 @@ export async function extractAttachmentContent(
               was_downloaded: true,
               extraction_status: "failed",
               skip_reason: null,
-              failure_category: "ocr_unavailable",
+              failure_category: "ocr_not_configured",
               failure_detail: "pdftoppm/poppler-utils missing on server",
               user_action_needed: userAction,
               extraction_method: "none",
@@ -1798,6 +1819,7 @@ export async function extractAttachmentContent(
             },
             buffer: attachmentData,
             processedBuffer,
+            ocrPageImages: ocr.pageImages.length > 0 ? ocr.pageImages : null,
           };
         } catch (ocrErr) {
           const errMsg =
@@ -2248,7 +2270,7 @@ export async function extractAttachmentContent(
 
 /**
  * Build the deterministic in-ZIP storage path for an attachment.
- * Pattern: attachments/<messageId>/<3-digit-partIdx>_<sha256[:8]>_<safe_filename>
+ * Pattern: extracted_attachments/<messageId>/<3-digit-partIdx>_<sha256[:8]>_<safe_filename>
  */
 export function buildStoragePath(
   messageId: string,
@@ -2258,5 +2280,5 @@ export function buildStoragePath(
 ): string {
   const partStr = String(partIndex + 1).padStart(3, "0");
   const shaPrefix = sha256 ? sha256.slice(0, 8) : "nohash00";
-  return `attachments/${messageId}/${partStr}_${shaPrefix}_${safeFilename}`;
+  return `extracted_attachments/${messageId}/${partStr}_${shaPrefix}_${safeFilename}`;
 }

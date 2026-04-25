@@ -1,0 +1,287 @@
+Fix and harden the existing Gmail Query Exporter attachment/export pipeline.
+
+The current implementation exports multiple separate files and has inconsistent attachment reporting. It also marks image attachments as unsupported because OCR is not configured. This must be corrected.
+
+Do not rebuild the application. Patch the existing project.
+
+MANDATORY FIXES
+
+1. Single export package
+When the user clicks export, generate ONE downloadable ZIP file by default.
+
+The ZIP must contain:
+- full_export.json
+- ai_ingestion.jsonl
+- export_manifest.json
+- processing_log.json
+- attachments_index.json
+- errors_report.json
+- extracted_attachments/ folder where applicable
+- ocr_images/ folder where applicable
+
+The user should not have to manually manage five separate files.
+
+2. Stable export location
+Create a persistent export folder structure automatically.
+
+Use:
+exports/
+  latest/
+  export_<timestamp>/
+
+Always write the newest export to:
+exports/latest/
+
+Also write timestamped copies to:
+exports/export_<timestamp>/
+
+The app must remember/use this automatically. The user must not have to change the path every run.
+
+3. Fix manifest counts
+Correct the manifest counting logic.
+
+Rules:
+attachment_count_total = total attachments detected
+attachment_supported_count = attachments whose type can be processed by current pipeline
+attachment_unsupported_count = attachments unsupported by current pipeline
+attachment_extracted_success_count = successful extractions only
+attachment_failure_count = failed supported extractions
+attachment_skipped_count = intentionally skipped attachments
+
+These numbers must reconcile.
+
+Add validation before export:
+supported + unsupported should not exceed total unless clearly separated as categories.
+If counts do not reconcile, add an export validation error.
+
+4. Always calculate SHA256
+Every downloaded attachment must have:
+- sha256
+- size_bytes
+- storage_path
+- download_status
+
+Do not leave sha256 as null if the attachment was actually downloaded.
+
+If sha256 is null, explain why:
+- not_downloaded
+- download_failed
+- metadata_only
+
+5. Fix image handling
+Images must no longer be treated as permanently unsupported.
+
+For JPG, JPEG, PNG, TIFF:
+- download the image
+- store it
+- attempt OCR if OCR is enabled
+- if OCR is not enabled, mark:
+  extraction_status = "skipped"
+  failure_category = "ocr_not_configured"
+  user_action_needed = "Enable OCR or process image manually"
+
+Add OCR support using a Replit-compatible OCR approach.
+
+Preferred:
+- tesseract.js if practical
+or
+- a Python helper using pytesseract if available
+
+If OCR fails:
+- keep the image
+- include filename, path, and failure reason
+- do not silently drop it
+
+6. PDF security pipeline
+Integrate the existing PDF security-removal utility into the attachment pipeline.
+
+The flow must be:
+
+PDF attachment downloaded
+→ calculate sha256
+→ try normal PDF text extraction
+→ if extraction fails due to protection/security:
+   → attempt PDF unlock/security removal
+   → retry extraction
+→ if still unreadable:
+   → convert PDF pages to images
+   → run OCR if enabled
+→ if still failed:
+   → export clear failure record
+
+Important:
+- Do not run a separate Flask app.
+- Extract the useful pikepdf logic into an internal service/helper.
+- If the main app is Node/TypeScript, create a Python helper script only if necessary and call it cleanly from Node.
+
+7. PDF fallback to images
+Add fallback:
+convert protected/unreadable PDF pages to JPG/PNG.
+
+Store generated images under:
+ocr_images/<email_id>/<attachment_id>/
+
+Then OCR those images if OCR is enabled.
+
+The export must record:
+- pdf_unlock_attempted
+- pdf_unlock_status
+- pdf_to_images_attempted
+- pdf_to_images_status
+- ocr_attempted
+- ocr_status
+- final_extraction_status
+
+8. Attachment deduplication
+Implement attachment-level dedupe using SHA256.
+
+If the same attachment appears multiple times:
+- keep all parent email references
+- only store/process the binary once
+- mark duplicate attachments clearly
+
+Do not silently remove duplicates.
+
+9. Fix attachment status model
+Every attachment must have one of:
+
+download_status:
+- not_required
+- pending
+- success
+- failed
+
+extraction_status:
+- success
+- partial
+- failed
+- unsupported
+- skipped
+
+failure_category:
+- null
+- unsupported_file_type
+- encrypted_or_password_protected
+- corrupt_or_malformed
+- empty_file
+- too_large
+- extraction_timeout
+- parser_error
+- ocr_not_configured
+- ocr_failed
+- network_fetch_error
+- permission_error
+- unknown_error
+
+10. Export must include all attachment records
+Every email in full_export.json must include all attachments.
+
+For each attachment include:
+- metadata
+- storage path
+- download status
+- sha256
+- extraction status
+- extracted text if available
+- structured data if available
+- failure reason if not extracted
+- user action needed
+
+Never omit an attachment because it failed.
+
+11. AI ingestion output must include attachment failures
+ai_ingestion.jsonl must include:
+- email body chunks
+- successful attachment text chunks
+- failure notice chunks for unreadable attachments
+
+Example text for a failed attachment chunk:
+
+ATTACHMENT: secure-document.pdf
+STATUS: failed
+REASON: Password protected or encrypted PDF could not be read.
+USER ACTION: Remove security/password protection and rerun extraction.
+
+12. Processing log
+Keep the existing processing log style, but add events for:
+
+attachment_download_started
+attachment_download_completed
+attachment_hash_calculated
+attachment_extraction_started
+pdf_security_analysis_started
+pdf_security_analysis_completed
+pdf_unlock_started
+pdf_unlock_completed
+pdf_to_images_started
+pdf_to_images_completed
+ocr_started
+ocr_completed
+attachment_extraction_failed
+export_zip_created
+export_validation_completed
+
+Each event must include:
+- timestamp
+- message_id
+- attachment_id
+- filename
+- status
+- duration_ms
+- error_category
+- error_message
+- user_action_needed
+
+13. UI improvements
+In the export screen show:
+
+- Export ZIP button
+- Open latest export folder / download latest ZIP
+- total emails
+- total attachments
+- extracted attachments
+- failed attachments
+- unsupported attachments
+- OCR required
+- protected PDFs detected
+- duplicate attachments detected
+
+Add a Problems panel listing:
+- protected PDFs
+- OCR skipped images
+- failed OCR
+- unsupported files
+- failed downloads
+- count mismatch warnings
+
+14. No path re-entry
+The app must not ask the user to repeatedly change paths or folder names.
+
+Use automatic export paths:
+exports/latest/
+exports/export_<timestamp>/
+
+Allow optional override, but default must just work.
+
+15. Tests
+Add tests or test scripts for:
+- manifest count reconciliation
+- PNG image attachment with OCR disabled
+- PNG image attachment with OCR enabled
+- protected PDF unlock attempt
+- PDF fallback to images
+- duplicate attachment hash
+- ZIP export creation
+- ai_ingestion includes failed attachment notices
+
+FINAL ACCEPTANCE CRITERIA
+
+The fix is complete only when:
+- one ZIP export is produced
+- latest export folder is automatic
+- manifest counts reconcile
+- image attachments are downloaded and either OCR’d or clearly marked
+- PDFs go through unlock and fallback logic
+- failed attachments appear in full_export and ai_ingestion
+- no attachment is silently dropped
+- the user does not have to manually change folders every run

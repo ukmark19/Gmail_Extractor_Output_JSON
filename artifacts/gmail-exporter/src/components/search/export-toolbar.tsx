@@ -12,9 +12,13 @@ import {
   Paperclip,
   ShieldCheck,
   ShieldAlert,
+  Lock,
+  Copy,
+  Eye,
+  History,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useToast } from "@/hooks/use-toast";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -45,6 +49,7 @@ export interface ExportResult {
     attachment_failure_count: number;
     attachment_unsupported_count: number;
     attachment_skipped_count: number;
+    duplicate_attachments_count: number;
     email_body_failure_count: number;
     failure_breakdown: Record<string, number>;
     emails_with_any_errors: string[];
@@ -64,10 +69,29 @@ interface SummaryStats {
   extractedSuccess: number;
   failed: number;
   unsupported: number;
+  duplicates: number;
   zipFilename: string;
   zipSizeBytes: number;
   exportId: string;
   validationStatus: string;
+  /**
+   * Categories the user should be aware of, decoded from headers + the
+   * X-Export-Attachment-* counts. The Problems panel renders one row per
+   * non-zero category.
+   */
+  problems: ProblemRow[];
+}
+
+interface ProblemRow {
+  category:
+    | "failed"
+    | "unsupported"
+    | "ocr_required"
+    | "protected_pdf"
+    | "duplicate";
+  count: number;
+  label: string;
+  hint: string;
 }
 
 function triggerBlobDownload(blob: Blob, filename: string) {
@@ -88,6 +112,44 @@ function parseFilenameFromContentDisposition(value: string | null): string | nul
   return m ? m[1] : null;
 }
 
+/**
+ * Build the visible Problems-panel rows from the response headers we got
+ * from the export endpoint. We only show rows for categories with count > 0
+ * so the panel stays empty (and disappears) on a clean run.
+ */
+function buildProblemRows(args: {
+  failed: number;
+  unsupported: number;
+  duplicates: number;
+}): ProblemRow[] {
+  const out: ProblemRow[] = [];
+  if (args.failed > 0) {
+    out.push({
+      category: "failed",
+      count: args.failed,
+      label: "Extraction failures",
+      hint: "Open errors_report.json in the ZIP for the per-attachment reason and suggested action.",
+    });
+  }
+  if (args.unsupported > 0) {
+    out.push({
+      category: "unsupported",
+      count: args.unsupported,
+      label: "Unsupported file types",
+      hint: "These attachments were saved as bytes but no text was extracted (e.g. binary types we can't parse).",
+    });
+  }
+  if (args.duplicates > 0) {
+    out.push({
+      category: "duplicate",
+      count: args.duplicates,
+      label: "Duplicate attachments",
+      hint: "Identical bytes were stored once in the ZIP — duplicate index entries point at the original via duplicate_of.",
+    });
+  }
+  return out;
+}
+
 export function ExportToolbar({
   selectedCount,
   selectedMessageIds,
@@ -102,6 +164,65 @@ export function ExportToolbar({
   const [lastExportId, setLastExportId] = useState<string | null>(null);
   const [summary, setSummary] = useState<SummaryStats | null>(null);
   const [summaryOpen, setSummaryOpen] = useState(false);
+  const [latestAvailable, setLatestAvailable] = useState(false);
+  const [latestMtime, setLatestMtime] = useState<string | null>(null);
+  const [downloadingLatest, setDownloadingLatest] = useState(false);
+
+  // Probe whether a `latest.zip` exists on disk so we can enable the
+  // "Download Latest" button. Re-run after every successful export so the
+  // button toggles on as soon as the very first export lands.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/gmail/export/latest", {
+          method: "HEAD",
+          credentials: "include",
+        });
+        if (cancelled) return;
+        setLatestAvailable(r.ok);
+        setLatestMtime(r.headers.get("X-Export-Latest-Mtime"));
+      } catch {
+        if (!cancelled) setLatestAvailable(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [lastExportId]);
+
+  const handleDownloadLatest = async () => {
+    if (downloadingLatest) return;
+    setDownloadingLatest(true);
+    try {
+      const r = await fetch("/api/gmail/export/latest", {
+        method: "GET",
+        credentials: "include",
+      });
+      if (!r.ok) {
+        throw new Error(
+          r.status === 404
+            ? "No previous export is available yet."
+            : `Download failed (${r.status})`,
+        );
+      }
+      const blob = await r.blob();
+      const cd = r.headers.get("Content-Disposition");
+      const filename =
+        parseFilenameFromContentDisposition(cd) ?? "gmail-export-latest.zip";
+      triggerBlobDownload(blob, filename);
+      toast({ description: `Downloaded ${filename}` });
+    } catch (err) {
+      toast({
+        variant: "destructive",
+        description:
+          "Could not download latest export: " +
+          (err instanceof Error ? err.message : String(err)),
+      });
+    } finally {
+      setDownloadingLatest(false);
+    }
+  };
 
   const handleExport = async () => {
     if (selectedMessageIds.length === 0 || isPending) return;
@@ -144,6 +265,13 @@ export function ExportToolbar({
       triggerBlobDownload(blob, filename);
 
       const exportId = response.headers.get("X-Export-Id") ?? "";
+      const failed = Number(response.headers.get("X-Export-Attachment-Failed") ?? 0);
+      const unsupported = Number(
+        response.headers.get("X-Export-Attachment-Unsupported") ?? 0,
+      );
+      const duplicates = Number(
+        response.headers.get("X-Export-Attachment-Duplicate") ?? 0,
+      );
       const stats: SummaryStats = {
         exportId,
         emailsExported: Number(response.headers.get("X-Export-Email-Count") ?? 0),
@@ -153,14 +281,14 @@ export function ExportToolbar({
         extractedSuccess: Number(
           response.headers.get("X-Export-Attachment-Success") ?? 0,
         ),
-        failed: Number(response.headers.get("X-Export-Attachment-Failed") ?? 0),
-        unsupported: Number(
-          response.headers.get("X-Export-Attachment-Unsupported") ?? 0,
-        ),
+        failed,
+        unsupported,
+        duplicates,
         zipFilename: filename,
         zipSizeBytes: blob.size,
         validationStatus:
           response.headers.get("X-Export-Validation") ?? "unknown",
+        problems: buildProblemRows({ failed, unsupported, duplicates }),
       };
       setLastExportId(exportId);
       setSummary(stats);
@@ -187,6 +315,7 @@ export function ExportToolbar({
             attachment_failure_count: stats.failed,
             attachment_unsupported_count: stats.unsupported,
             attachment_skipped_count: 0,
+            duplicate_attachments_count: stats.duplicates,
             email_body_failure_count: 0,
             failure_breakdown: {},
             emails_with_any_errors: [],
@@ -210,6 +339,28 @@ export function ExportToolbar({
     return (
       <div className="h-10 flex items-center justify-between px-2 text-sm text-muted-foreground">
         <span>Select emails below to export.</span>
+        {latestAvailable ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleDownloadLatest}
+            disabled={downloadingLatest}
+            className="h-8 px-2 text-xs"
+            data-testid="button-download-latest-empty"
+            title={
+              latestMtime
+                ? `Last export: ${new Date(latestMtime).toLocaleString()}`
+                : "Re-download the most recent export"
+            }
+          >
+            {downloadingLatest ? (
+              <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" />
+            ) : (
+              <History className="h-3.5 w-3.5 mr-1" />
+            )}
+            Download Latest
+          </Button>
+        ) : null}
       </div>
     );
   }
@@ -244,6 +395,29 @@ export function ExportToolbar({
               <CheckCircle2 className="h-3.5 w-3.5" />
               <span>ZIP downloaded — view summary</span>
             </button>
+          )}
+
+          {latestAvailable && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleDownloadLatest}
+              disabled={downloadingLatest}
+              className="h-9"
+              data-testid="button-download-latest"
+              title={
+                latestMtime
+                  ? `Last export: ${new Date(latestMtime).toLocaleString()}`
+                  : "Re-download the most recent export"
+              }
+            >
+              {downloadingLatest ? (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <History className="mr-2 h-4 w-4" />
+              )}
+              Download Latest
+            </Button>
           )}
 
           <Button
@@ -317,6 +491,12 @@ export function ExportToolbar({
                   tone={summary.unsupported > 0 ? "warn" : "muted"}
                 />
                 <SummaryStat
+                  icon={<Copy className="h-4 w-4 text-sky-500" />}
+                  label="Duplicates collapsed"
+                  value={summary.duplicates}
+                  tone={summary.duplicates > 0 ? "info" : "muted"}
+                />
+                <SummaryStat
                   icon={<FileArchive className="h-4 w-4" />}
                   label="ZIP size"
                   value={Math.round(summary.zipSizeBytes / 1024)}
@@ -339,21 +519,49 @@ export function ExportToolbar({
                     <code>ai_ingestion.jsonl</code>,{" "}
                     <code>attachments_index.json</code>,{" "}
                     <code>export_manifest.json</code>,{" "}
-                    <code>processing_log.json</code> plus all downloaded
-                    attachments under <code>attachments/</code>.
+                    <code>processing_log.json</code>,{" "}
+                    <code>errors_report.json</code> plus all downloaded
+                    attachments under <code>extracted_attachments/</code>{" "}
+                    and any OCR'd page PNGs under <code>ocr_images/</code>.
                   </div>
                 </div>
               </div>
 
-              {summary.failed === 0 && summary.unsupported === 0 ? (
+              {summary.problems.length === 0 ? (
                 <div className="text-xs text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 rounded p-2">
                   All attachments processed cleanly.
                 </div>
               ) : (
-                <div className="text-xs text-amber-700 dark:text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded p-2">
-                  Some attachments need attention. Open{" "}
-                  <code>processing_log.json</code> in the ZIP for the full
-                  audit trail.
+                <div className="border border-amber-500/30 rounded-md bg-amber-500/5">
+                  <div className="px-2.5 py-1.5 border-b border-amber-500/20 text-xs font-medium text-amber-700 dark:text-amber-400 flex items-center gap-1.5">
+                    <Eye className="h-3.5 w-3.5" />
+                    Problems
+                  </div>
+                  <ul
+                    className="divide-y divide-amber-500/15"
+                    data-testid="export-problems-panel"
+                  >
+                    {summary.problems.map((p) => (
+                      <li
+                        key={p.category}
+                        className="px-2.5 py-2 flex items-start gap-2 text-xs"
+                        data-testid={`problem-row-${p.category}`}
+                      >
+                        <ProblemIcon category={p.category} />
+                        <div className="flex-1">
+                          <div className="font-medium">
+                            {p.label}{" "}
+                            <span className="text-muted-foreground font-normal">
+                              ({p.count})
+                            </span>
+                          </div>
+                          <div className="text-muted-foreground mt-0.5">
+                            {p.hint}
+                          </div>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
             </div>
@@ -374,6 +582,31 @@ export function ExportToolbar({
   );
 }
 
+function ProblemIcon({ category }: { category: ProblemRow["category"] }) {
+  switch (category) {
+    case "failed":
+      return (
+        <AlertTriangle className="h-3.5 w-3.5 mt-0.5 text-destructive shrink-0" />
+      );
+    case "unsupported":
+      return (
+        <FileQuestion className="h-3.5 w-3.5 mt-0.5 text-amber-500 shrink-0" />
+      );
+    case "ocr_required":
+      return (
+        <Eye className="h-3.5 w-3.5 mt-0.5 text-amber-500 shrink-0" />
+      );
+    case "protected_pdf":
+      return (
+        <Lock className="h-3.5 w-3.5 mt-0.5 text-amber-500 shrink-0" />
+      );
+    case "duplicate":
+      return <Copy className="h-3.5 w-3.5 mt-0.5 text-sky-500 shrink-0" />;
+    default:
+      return null;
+  }
+}
+
 function SummaryStat({
   icon,
   label,
@@ -385,7 +618,7 @@ function SummaryStat({
   label: string;
   value: number;
   unit?: string;
-  tone?: "neutral" | "success" | "error" | "warn" | "muted";
+  tone?: "neutral" | "success" | "error" | "warn" | "muted" | "info";
 }) {
   const toneClass =
     tone === "success"
@@ -394,9 +627,11 @@ function SummaryStat({
         ? "text-destructive"
         : tone === "warn"
           ? "text-amber-700 dark:text-amber-400"
-          : tone === "muted"
-            ? "text-muted-foreground"
-            : "text-foreground";
+          : tone === "info"
+            ? "text-sky-700 dark:text-sky-400"
+            : tone === "muted"
+              ? "text-muted-foreground"
+              : "text-foreground";
   return (
     <div className="border rounded-md p-2.5 bg-card">
       <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
