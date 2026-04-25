@@ -1,0 +1,72 @@
+Patch the remaining attachment/export issues only.
+
+Current export is now mostly working:
+- 47 emails exported
+- 117 attachments detected
+- 102 attachments extracted successfully
+- 15 failures
+- ZIP export works
+
+Remaining issues:
+
+1. Install/enable PDF-to-image and OCR dependencies
+The processing log shows failures:
+"pdftoppm/poppler-utils missing on server"
+
+Fix this in the Replit environment.
+
+Add required system dependencies in replit.nix or equivalent:
+- poppler-utils
+- tesseract if OCR is being used
+- any required image processing dependency
+
+Then verify:
+- pdftoppm is available at runtime
+- OCR/PDF fallback no longer fails due to missing environment dependency
+
+2. Fix manifest count reconciliation
+Current manifest has impossible counts:
+attachment_supported_count = 92
+attachment_unsupported_count = 25
+attachment_extracted_success_count = 102
+
+Rules:
+- attachment_count_total must equal all attachment records
+- attachment_extracted_success_count must be count where extraction_status === "success"
+- attachment_failure_count must be count where extraction_status === "failed"
+- attachment_partial_count must be count where extraction_status === "partial"
+- attachment_skipped_count must be count where extraction_status === "skipped"
+- attachment_supported_count should mean attachments whose type is processable by the pipeline
+- attachment_unsupported_count should mean genuinely unsupported file types only
+
+Add validation:
+- success + failed + partial + skipped + unsupported should reconcile against total
+- if not, write export_validation_error
+
+3. Classify unnamed attachments properly
+There are many extracted attachments named "unnamed" with no extension.
+
+For each attachment:
+- derive type from MIME type if filename/extension missing
+- assign safe filename using MIME type
+- do not leave extension as null where MIME type allows inference
+- distinguish inline body parts/signatures from real attachments
+
+4. Improve error reporting
+For each failed attachment, record:
+- message_id
+- filename
+- mime_type
+- storage_path
+- failure_category
+- failure_detail
+- user_action_needed
+
+5. Acceptance criteria
+After patch:
+- ZIP export still works
+- email_count remains correct
+- attachment count math reconciles
+- pdftoppm/poppler missing error is gone
+- OCR/PDF fallback either succeeds or fails for a real document reason
+- unnamed attachments have better MIME-based classification
