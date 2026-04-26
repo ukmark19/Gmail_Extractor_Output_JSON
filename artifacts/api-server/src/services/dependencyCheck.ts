@@ -87,6 +87,7 @@ export function getDependencyReport(): DependencyReport | null {
 }
 
 // Avoid two callers kicking off duplicate concurrent probes.
+// Capability test: Codex can edit and publish this repository.
 let pendingProbe: Promise<DependencyReport> | null = null;
 
 /**
