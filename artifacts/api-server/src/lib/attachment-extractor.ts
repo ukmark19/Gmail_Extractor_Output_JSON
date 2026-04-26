@@ -14,6 +14,15 @@ import {
 } from "../services/pdfSecurityService";
 import { ensureDependencyReport } from "../services/dependencyCheck";
 
+/**
+ * Source-file marker. Bump the version suffix whenever the OCR branch
+ * logic in this file changes so the startup log can verify that the
+ * running bundle contains the latest source. Surfaced via
+ * src/index.ts startup diagnostics.
+ */
+export const ATTACHMENT_EXTRACTOR_BUILD_MARKER =
+  "attachment-extractor:ocr-deps-check-v2";
+
 const OCR_MAX_PAGES = 20;
 const OCR_TRIGGER_CHAR_THRESHOLD = 50;
 const OCR_ENABLED_DEFAULT = true;
