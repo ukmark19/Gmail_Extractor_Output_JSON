@@ -21,6 +21,13 @@ if (Number.isNaN(port) || port <= 0) {
 
 // Probe binary dependencies at startup so missing tools surface as environment_error
 // rather than being misreported as document failures.
+//
+// Also log PATH so triage of "binary missing on server" errors can immediately
+// confirm that the Nix bin dirs (poppler-utils, tesseract, qpdf) are reachable
+// to the Node process. Shell PATH and Node-process PATH can diverge if the
+// workflow command runs in a different shell context, so logging here is the
+// authoritative source.
+console.log("[deps.path_env]", process.env["PATH"] ?? "");
 checkDependencies()
   .then(logDependencyReport)
   .catch((err) =>

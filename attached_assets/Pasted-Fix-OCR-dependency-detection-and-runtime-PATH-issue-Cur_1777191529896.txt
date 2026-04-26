@@ -1,0 +1,71 @@
+Fix OCR dependency detection and runtime PATH issue.
+
+Current state:
+- Shell confirms these binaries exist:
+  - pdftoppm
+  - tesseract
+  - qpdf
+- But exports still fail with:
+  "pdftoppm/poppler-utils missing on server"
+- Manifest still shows:
+  ocr_not_configured = 13
+
+This means the runtime dependency check used by the API/export pipeline is not seeing the same PATH as the shell, or it is caching a stale failed result.
+
+Tasks:
+
+1. Locate the dependency check logic, likely:
+artifacts/api-server/src/services/dependencyCheck.ts
+and any caller in attachment-extractor/pdf OCR pipeline.
+
+2. Ensure dependency detection checks these commands at runtime:
+- pdftoppm
+- pdftotext
+- pdfinfo
+- tesseract
+- qpdf
+
+3. Do not rely only on `which`.
+Use child_process/spawnSync or execFileSync with:
+- command availability
+- version check
+- full error logging
+
+4. Log:
+- process.env.PATH
+- resolved binary path
+- binary version
+- dependency check result
+
+5. Remove any stale cache or make dependency check refreshable.
+If dependencies are cached, ensure cache is populated after server startup, not before Nix environment is ready.
+
+6. Add a debug endpoint:
+GET /api/system/dependencies
+
+It should return:
+{
+  "pdftoppm": { "available": true, "path": "...", "version": "..." },
+  "tesseract": { "available": true, "path": "...", "version": "..." },
+  "qpdf": { "available": true, "path": "...", "version": "..." },
+  "ocr_capable": true,
+  "pdf_page_text_capable": true,
+  "pdf_security_capable": true
+}
+
+7. Ensure attachment extraction uses this dependency status.
+If pdftoppm is available, it must not return:
+"pdftoppm/poppler-utils missing on server"
+
+8. Do not change:
+- manifest reconciliation
+- export JSON safety
+- Gmail search
+- OAuth
+- frontend layout
+
+Acceptance test:
+- Shell `which pdftoppm` returns a path
+- GET /api/system/dependencies returns pdftoppm.available = true
+- Re-running export no longer produces "pdftoppm/poppler-utils missing on server"
+- If OCR fails after that, the error must be a real OCR/document error, not missing dependency.

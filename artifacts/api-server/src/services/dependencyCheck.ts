@@ -115,6 +115,21 @@ export function getDependencyReport(): DependencyReport | null {
 let pendingProbe: Promise<DependencyReport> | null = null;
 
 /**
+ * Force re-probing of all binaries, ignoring the cached report. Used by
+ * the GET /api/system/dependencies?refresh=1 debug endpoint so operators
+ * can re-check after fixing PATH/Nix issues without restarting the
+ * server. If a probe is already in flight it is reused.
+ */
+export async function refreshDependencyReport(): Promise<DependencyReport> {
+  cachedReport = null;
+  if (pendingProbe) return pendingProbe;
+  pendingProbe = checkDependencies().finally(() => {
+    pendingProbe = null;
+  });
+  return pendingProbe;
+}
+
+/**
  * Always returns a populated DependencyReport. If the startup probe hasn't
  * finished yet, this awaits it (or runs one) instead of returning null.
  *

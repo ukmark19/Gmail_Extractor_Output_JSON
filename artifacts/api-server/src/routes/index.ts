@@ -5,6 +5,7 @@ import gmailRouter from "./gmail";
 import exportRouter from "./export";
 import savedSearchesRouter from "./saved-searches";
 import exportLogsRouter from "./export-logs";
+import systemRouter from "./system";
 
 const router: IRouter = Router();
 
@@ -14,5 +15,6 @@ router.use(gmailRouter);
 router.use(exportRouter);
 router.use(savedSearchesRouter);
 router.use(exportLogsRouter);
+router.use(systemRouter);
 
 export default router;

@@ -1,7 +1,7 @@
-{pkgs}: {
+{ pkgs }: {
   deps = [
     pkgs.tesseract
-    pkgs.poppler-utils
+    pkgs.poppler_utils
     pkgs.qpdf
   ];
 }
