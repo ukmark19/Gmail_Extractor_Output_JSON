@@ -411,8 +411,7 @@ export type FailureCategory =
   | "extraction_timeout"
   | "parser_error"
   | "ocr_failed"
-  // ocr_not_configured is emitted when OCR is required but disabled
-  // or when the system OCR pipeline (pdftoppm) is unavailable.
+  // ocr_not_configured is emitted only when OCR is explicitly disabled by config.
   | "ocr_not_configured"
   | "environment_error"
   | "network_fetch_error"
@@ -1903,14 +1902,9 @@ export async function extractAttachmentContent(
 
         if (!pdftoppmAvailable) {
           const actualError =
-            `OCR unavailable in this export path. Dependency snapshot: ` +
-            `pdftoppm_available=${pdftoppmAvailable}, ` +
-            `pdftoppm_path=${pdftoppmPath ?? "null"}, ` +
-            `tesseract_available=${tesseractAvailable}, ` +
-            `tesseract_path=${tesseractPath ?? "null"}, ` +
-            `ocr_capable=${ocrCapable}`;
-
-          const chosenFailureCategory: FailureCategory = "ocr_failed";
+            `OCR runtime failure: pdftoppm unavailable at execution time. ` +
+            `Dependency snapshot: pdftoppm_available=${pdftoppmAvailable}, ` +
+            `pdftoppm_path=${pdftoppmPath ?? "null"}`;
 
           processingLog.push(
             makeLogEntry(
@@ -1922,10 +1916,8 @@ export async function extractAttachmentContent(
               startTime,
               {
                 extraction_method: "ocr",
-                error_category: chosenFailureCategory,
+                error_category: "ocr_failed",
                 error_message: actualError,
-                user_action_needed:
-                  "OCR dependency check failed inside the export path despite system dependency endpoint. Review dependency snapshot in processing log.",
               },
             ),
           );
@@ -1937,41 +1929,14 @@ export async function extractAttachmentContent(
               is_supported: true,
               was_downloaded: true,
               extraction_status: "failed",
-              skip_reason: null,
-              failure_category: chosenFailureCategory,
+              failure_category: "ocr_failed",
               failure_detail: actualError,
               user_action_needed:
-                "OCR dependency check failed inside the export path despite system dependency endpoint. Review dependency snapshot in processing log.",
+                "OCR failed at runtime despite dependency check. See logs.",
               extraction_method: "none",
               text_extracted: false,
               text_quality: "unknown",
-              is_encrypted: isEncryptedFlag,
-              unlock_attempted: unlockAttempted,
-              unlock_status: unlockStatus,
-              unlock_error: unlockError,
-              security_removed: securityRemoved,
-              security_removal_method: securityRemovalMethod,
-              security_removal_error: securityRemovalError,
-              fallback_used: false,
-              fallback_method: null,
-              pages,
-              pages_extracted_count: pages.filter((p) => p.text_extracted)
-                .length,
-              pages_failed_count: pages.filter((p) => !p.text_extracted).length,
-              contains_structured_data: false,
-              structured_data_type: "none",
-              page_count: resolvedPageCount,
-              sheet_names: null,
-              extracted_text: null,
-              structured_data: null,
-              warnings,
-              errors,
             },
-            // Persist the raw + processed bytes EVEN on the OCR-missing
-            // failure path. The bytes are still useful: we still want
-            // them in the ZIP under attachments/ so the user can manually
-            // OCR locally. Returning null/missing here would silently
-            // drop the file from the export (the previous regression).
             buffer: attachmentData,
             processedBuffer,
           };
@@ -2144,7 +2109,7 @@ export async function extractAttachmentContent(
           // Diagnostic event so the manifest's processing_log captures
           // the dep-probe state at the moment the OCR failure was
           // classified — proving definitively that the failure was NOT
-          // ocr_not_configured when pdftoppm.available === true.
+          // ocr_failed when pdftoppm.available === true.
           processingLog.push(
             makeLogEntry(
               messageId,
