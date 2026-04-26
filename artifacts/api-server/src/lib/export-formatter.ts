@@ -158,6 +158,36 @@ export interface ValidationReport {
   validation_status: "ok" | "warnings" | "failed";
   validation_errors: string[];
   validation_warnings: string[];
+  /**
+   * Subset of messages that come specifically from the manifest count
+   * reconciliation rules (success + partial + failed + skipped +
+   * unsupported = total, supported + unsupported = total, success ≤
+   * supported). Surfaced separately so `buildExportBundle` can splice
+   * them into `errors_report.json` as `export_validation_error`
+   * entries.
+   *
+   * Always present, even when empty, so consumers don't have to
+   * null-check.
+   */
+  manifest_reconciliation_errors: string[];
+}
+
+/**
+ * Test helper: predicate matching the spec rule
+ * "attachment_unsupported_count = count where extraction_status ===
+ * 'unsupported' OR failure_category === 'unsupported_file_type'".
+ *
+ * Exported so tests/callers can re-derive the same partition the
+ * manifest uses.
+ */
+export function isUnsupportedAttachment(att: {
+  extraction_status: string;
+  failure_category?: string | null;
+}): boolean {
+  return (
+    att.extraction_status === "unsupported" ||
+    att.failure_category === "unsupported_file_type"
+  );
 }
 
 export interface DetailedManifest {
@@ -539,7 +569,6 @@ export function buildDetailedManifest(
   let emailBodySuccess = 0;
   let emailBodyFailure = 0;
   let attachmentTotal = 0;
-  let attachmentSupported = 0;
   let attachmentUnsupported = 0;
   let attachmentSuccess = 0;
   let attachmentPartial = 0;
@@ -572,38 +601,39 @@ export function buildDetailedManifest(
     for (const att of attachments) {
       if (att.duplicate_of) duplicateCount++;
 
-      // Status buckets ARE the source of truth and partition `total`
-      // exactly. Previously we had a parallel `is_supported` flag deciding
-      // supported vs unsupported, which let an attachment be counted as
-      // both `unsupported` and `success` (e.g. inline parts marked
-      // is_supported=false but extracted via the plain-text branch). That
-      // caused the impossible manifest math the user reported
-      // (success=102 > supported=92). Derive supported/unsupported from
-      // extraction_status only.
+      // Spec rules for the count buckets:
+      //   - attachment_extracted_success_count = where extraction_status === "success"
+      //   - attachment_partial_count           = where extraction_status === "partial"
+      //   - attachment_failure_count           = where extraction_status === "failed"
+      //   - attachment_skipped_count           = where extraction_status === "skipped"
+      //   - attachment_unsupported_count       = where extraction_status === "unsupported"
+      //                                            OR failure_category === "unsupported_file_type"
+      //   - attachment_supported_count         = total − unsupported (computed once at the end)
+      //
+      // Each predicate is applied INDEPENDENTLY, exactly as written in
+      // the spec, so a record with extraction_status="failed" AND
+      // failure_category="unsupported_file_type" is intentionally
+      // counted in BOTH buckets. The reconciliation pass in
+      // `validateExportBundle` then catches that overlap and emits an
+      // `export_validation_error` entry — surfacing the upstream data
+      // inconsistency rather than silently masking it.
       switch (att.extraction_status) {
         case "success":
           attachmentSuccess++;
-          attachmentSupported++;
           break;
         case "partial":
           attachmentPartial++;
-          attachmentSupported++;
           break;
         case "failed":
           attachmentFailed++;
-          attachmentSupported++;
           emailHasError = true;
           break;
         case "skipped":
           attachmentSkipped++;
-          // A skipped item is "of a supported type but we deliberately
-          // didn't process it" (e.g. too large) — treat as supported so
-          // unsupported_count truly means "MIME type not in pipeline".
-          attachmentSupported++;
           break;
-        case "unsupported":
-          attachmentUnsupported++;
-          break;
+      }
+      if (isUnsupportedAttachment(att)) {
+        attachmentUnsupported++;
       }
 
       if (att.failure_category) {
@@ -627,6 +657,12 @@ export function buildDetailedManifest(
     }
     if (emailHasError) emailsWithErrors.push(email.id);
   }
+
+  // Per spec: supported = total − unsupported. Computing it as a
+  // derived value (rather than a parallel per-attachment counter)
+  // makes the reconciliation rule
+  // `supported + unsupported === total` hold by construction.
+  const attachmentSupported = attachmentTotal - attachmentUnsupported;
 
   return {
     export_version: "1.2",
@@ -1018,6 +1054,17 @@ export function validateExportBundle(
 ): ValidationReport {
   const errors: string[] = [];
   const warnings: string[] = [];
+  // Manifest reconciliation messages live in their own bucket so we can
+  // (a) optionally demote them to warnings via env var without
+  // affecting the OTHER hard invariants below, and (b) splice them
+  // verbatim into errors_report.json as `export_validation_error`
+  // entries.
+  const reconciliation: string[] = [];
+  const reconciliationMode =
+    (process.env.EXPORT_MANIFEST_RECONCILIATION_MODE ?? "").trim() ===
+    "warning-only"
+      ? "warning-only"
+      : "error";
 
   // 1. every attachment in full_export exists in attachments_index
   const indexById = new Map<string, AttachmentIndexEntry>();
@@ -1093,19 +1140,21 @@ export function validateExportBundle(
     }
   }
 
-  // 5. manifest counts reconcile (HARD invariant — promote to error so the
-  // ZIP is marked validation_failed if the math doesn't add up).
+  // 5. Manifest count reconciliation (spec rules). All three messages
+  //    are routed through the `reconciliation` bucket so the
+  //    EXPORT_MANIFEST_RECONCILIATION_MODE env var can demote them
+  //    uniformly. Default behaviour: failure (export validation fails).
+  //
+  // 5a. supported + unsupported === total
   if (
     manifest.attachment_supported_count + manifest.attachment_unsupported_count !==
     manifest.attachment_count_total
   ) {
-    errors.push(
+    reconciliation.push(
       `manifest: supported(${manifest.attachment_supported_count}) + unsupported(${manifest.attachment_unsupported_count}) != total(${manifest.attachment_count_total})`,
     );
   }
-  // Required reconciliation per spec: success + partial + failed + skipped +
-  // unsupported MUST equal total. Anything else means we lost track of an
-  // attachment somewhere in the pipeline and the manifest is misleading.
+  // 5b. success + partial + failed + skipped + unsupported === total
   const reconciliationSum =
     manifest.attachment_extracted_success_count +
     manifest.attachment_partial_count +
@@ -1113,17 +1162,16 @@ export function validateExportBundle(
     manifest.attachment_skipped_count +
     manifest.attachment_unsupported_count;
   if (reconciliationSum !== manifest.attachment_count_total) {
-    errors.push(
-      `manifest: status reconciliation failed — success(${manifest.attachment_extracted_success_count}) + partial(${manifest.attachment_partial_count}) + failed(${manifest.attachment_failure_count}) + skipped(${manifest.attachment_skipped_count}) + unsupported(${manifest.attachment_unsupported_count}) = ${reconciliationSum} != total(${manifest.attachment_count_total})`,
+    reconciliation.push(
+      `manifest: status reconciliation failed — success(${manifest.attachment_extracted_success_count}) + partial(${manifest.attachment_partial_count}) + failed(${manifest.attachment_failure_count}) + skipped(${manifest.attachment_skipped_count}) + unsupported(${manifest.attachment_unsupported_count}) = ${reconciliationSum} != total(${manifest.attachment_count_total}). This typically means an attachment record has both extraction_status="failed" and failure_category="unsupported_file_type", causing it to be counted in two buckets — fix the upstream classifier so the record falls into exactly one bucket.`,
     );
   }
-  // Implied invariant: success_count must not exceed supported_count (the
-  // exact bug the user observed: 102 > 92).
+  // 5c. success ≤ supported  (the exact bug originally reported: 102 > 92)
   if (
     manifest.attachment_extracted_success_count >
     manifest.attachment_supported_count
   ) {
-    errors.push(
+    reconciliation.push(
       `manifest: success(${manifest.attachment_extracted_success_count}) exceeds supported(${manifest.attachment_supported_count}) — supported/unsupported buckets are inconsistent with extraction_status`,
     );
   }
@@ -1168,6 +1216,18 @@ export function validateExportBundle(
     }
   }
 
+  // Fold reconciliation messages into the appropriate bucket. In
+  // "warning-only" mode (set via EXPORT_MANIFEST_RECONCILIATION_MODE)
+  // the messages still appear in the report and in
+  // errors_report.json, but they no longer fail validation —
+  // operators can use this to ride out a partial rollout that hasn't
+  // yet fixed the upstream classifier.
+  if (reconciliationMode === "warning-only") {
+    for (const m of reconciliation) warnings.push(m);
+  } else {
+    for (const m of reconciliation) errors.push(m);
+  }
+
   let status: ValidationReport["validation_status"] = "ok";
   if (errors.length > 0) status = "failed";
   else if (warnings.length > 0) status = "warnings";
@@ -1176,6 +1236,7 @@ export function validateExportBundle(
     validation_status: status,
     validation_errors: errors,
     validation_warnings: warnings,
+    manifest_reconciliation_errors: reconciliation,
   };
 }
 
@@ -1229,6 +1290,38 @@ export function buildExportBundle(
     tentativeCounts,
     emails,
   );
+
+  // Per spec: when manifest reconciliation fails, surface each
+  // failing rule as an `export_validation_error` entry in
+  // errors_report.json so downstream consumers (humans + LLMs) see it
+  // alongside the per-attachment failures. The same messages also
+  // live in `validation.validation_errors` (or
+  // `validation_warnings` under EXPORT_MANIFEST_RECONCILIATION_MODE
+  // = "warning-only").
+  if (validation.manifest_reconciliation_errors.length > 0) {
+    const entries: ErrorsReportEntry[] = validation.manifest_reconciliation_errors.map(
+      (msg) => ({
+        message_id: "",
+        attachment_id: "",
+        filename: "",
+        mime_type: "",
+        category: "export_validation_error",
+        failure_category: "export_validation_error",
+        status: "failed" as ExtractionStatusLabel,
+        detail: msg,
+        failure_detail: msg,
+        user_action_needed:
+          "Fix the upstream attachment classifier so each record falls into exactly one count bucket, OR set EXPORT_MANIFEST_RECONCILIATION_MODE=warning-only to allow exports while triaging.",
+        storage_path: "",
+      }),
+    );
+    errorsReport.push({
+      category: "export_validation_error",
+      count: entries.length,
+      entries,
+    });
+  }
+
   const manifest = buildDetailedManifest(
     exportId,
     emails,
@@ -1265,7 +1358,6 @@ function computeManifestCountsOnly(
   | "attachment_skipped_count"
 > {
   let total = 0;
-  let supported = 0;
   let unsupported = 0;
   let success = 0;
   let partial = 0;
@@ -1274,36 +1366,32 @@ function computeManifestCountsOnly(
   for (const { attachments } of emails) {
     total += attachments.length;
     for (const a of attachments) {
-      // Mirror the partition used by buildDetailedManifest: derive
-      // supported/unsupported strictly from extraction_status so that the
-      // validation pass and the manifest agree by construction.
-      // The legacy `is_supported` flag remains on the per-attachment
-      // record for diagnostic use only and is intentionally NOT consulted
-      // here — using both produced the impossible "success > supported"
-      // case (e.g. images returning success but is_supported=false).
+      // Apply the spec's count predicates independently — see the long
+      // comment in `buildDetailedManifest` for the full rationale. The
+      // two functions MUST agree on every count so the validation pass
+      // can compare manifest counts against re-derived counts without
+      // false positives.
       switch (a.extraction_status) {
         case "success":
           success++;
-          supported++;
           break;
         case "partial":
           partial++;
-          supported++;
           break;
         case "failed":
           failed++;
-          supported++;
           break;
         case "skipped":
           skipped++;
-          supported++;
           break;
-        case "unsupported":
-          unsupported++;
-          break;
+      }
+      if (isUnsupportedAttachment(a)) {
+        unsupported++;
       }
     }
   }
+  // supported = total − unsupported, per spec.
+  const supported = total - unsupported;
   return {
     attachment_count_total: total,
     attachment_supported_count: supported,
