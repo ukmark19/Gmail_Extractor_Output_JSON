@@ -1,3 +1,13 @@
+process.env.PATH = [
+  process.env.PATH,
+  "/nix/store",
+  "/run/current-system/sw/bin",
+]
+  .filter(Boolean)
+  .join(":");
+
+console.log("PATH at startup:", process.env.PATH);
+
 import app from "./app";
 import { logger } from "./lib/logger";
 import {
@@ -19,20 +29,19 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-// Probe binary dependencies at startup so missing tools surface as environment_error
-// rather than being misreported as document failures.
-//
-// Also log PATH so triage of "binary missing on server" errors can immediately
-// confirm that the Nix bin dirs (poppler-utils, tesseract, qpdf) are reachable
-// to the Node process. Shell PATH and Node-process PATH can diverge if the
-// workflow command runs in a different shell context, so logging here is the
-// authoritative source.
-console.log("[deps.path_env]", process.env["PATH"] ?? "");
+// Probe binary dependencies at startup so missing tools surface clearly.
+// This log is the authoritative PATH seen by the Node process.
 checkDependencies()
-  .then(logDependencyReport)
-  .catch((err) =>
-    console.error("[deps.check_failed]", err instanceof Error ? err.message : err),
-  );
+  .then((report) => {
+    console.log("[deps.report]", JSON.stringify(report, null, 2));
+    logDependencyReport(report);
+  })
+  .catch((err) => {
+    console.error(
+      "[deps.check_failed]",
+      err instanceof Error ? err.message : String(err),
+    );
+  });
 
 app.listen(port, (err) => {
   if (err) {

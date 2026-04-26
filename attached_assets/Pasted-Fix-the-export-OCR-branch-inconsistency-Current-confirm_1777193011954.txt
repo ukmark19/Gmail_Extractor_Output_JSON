@@ -1,0 +1,74 @@
+Fix the export OCR branch inconsistency.
+
+Current confirmed state:
+- GET /api/system/dependencies returns:
+  - pdftoppm.available = true
+  - tesseract.available = true
+  - qpdf.available = true
+  - ocr_capable = true
+  - pdf_page_text_capable = true
+- Shell also confirms pdftoppm, tesseract, and qpdf exist.
+- However, Gmail export still reports:
+  - ocr_not_configured
+  - "pdftoppm/poppler-utils missing on server"
+
+This means the export/attachment extraction branch is not using the same dependency state as /api/system/dependencies, or it is using stale/hardcoded failure logic.
+
+Modify only the OCR/PDF fallback dependency usage path.
+
+Likely files:
+- artifacts/api-server/src/lib/attachment-extractor.ts
+- artifacts/api-server/src/services/dependencyCheck.ts only if absolutely required
+
+Do not change:
+- manifest reconciliation
+- export JSON safety
+- Gmail search
+- OAuth
+- frontend layout
+- database schema
+
+Tasks:
+
+1. Find every branch in attachment-extractor.ts that sets:
+- failure_category = "ocr_not_configured"
+- failure_detail = "pdftoppm/poppler-utils missing on server"
+- user_action_needed mentioning poppler-utils missing
+
+2. Ensure those branches call:
+await ensureDependencyReport()
+immediately before deciding OCR is unavailable.
+
+3. If deps.pdftoppm.available is true, the code must not return:
+"pdftoppm/poppler-utils missing on server"
+
+4. When running pdftoppm, use the resolved absolute path:
+deps.pdftoppm.path ?? "pdftoppm"
+
+5. When running tesseract, use:
+deps.tesseract.path ?? "tesseract"
+
+6. Add temporary diagnostic processing log events around OCR decision:
+- ocr_dependency_check_started
+- ocr_dependency_check_completed
+Include:
+- pdftoppm_available
+- pdftoppm_path
+- tesseract_available
+- tesseract_path
+- ocr_capable
+
+7. If OCR still cannot run, classify based on actual cause:
+- missing dependency only if deps.pdftoppm.available === false
+- OCR command failure as ocr_failed
+- PDF rasterisation failure as parser_error or ocr_failed with actual stderr
+- timeout as extraction_timeout
+
+8. Build must pass:
+pnpm --filter @workspace/api-server build
+
+Acceptance test:
+- /api/system/dependencies?refresh=1 reports pdftoppm.available = true
+- export no longer reports "pdftoppm/poppler-utils missing on server"
+- export no longer uses ocr_not_configured when pdftoppm.available = true
+- remaining OCR failures, if any, show real command/document errors

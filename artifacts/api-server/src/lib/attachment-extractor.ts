@@ -199,6 +199,12 @@ async function extractPdfPages(
   }
 }
 
+type OcrFailureCategory =
+  | "environment_error"
+  | "extraction_timeout"
+  | "parser_error"
+  | "ocr_failed";
+
 async function ocrPdfPages(
   buffer: Buffer,
   meta: { messageId: string; attachmentId: string; filename: string },
@@ -207,6 +213,7 @@ async function ocrPdfPages(
   pagesProcessed: number;
   pagesTotal: number | null;
   error: string | null;
+  failureCategory: OcrFailureCategory | null;
   pageImages: Array<{ pageNumber: number; png: Buffer }>;
 }> {
   // Always await — `getDependencyReport()` returns null until the startup
@@ -218,9 +225,14 @@ async function ocrPdfPages(
       pagesProcessed: 0,
       pagesTotal: null,
       error: "pdftoppm (poppler-utils) not installed — cannot rasterize for OCR",
+      failureCategory: "environment_error",
       pageImages: [],
     };
   }
+  // Use the resolved absolute Nix-store path when available so we spawn
+  // the same binary surfaced by GET /api/system/dependencies, instead of
+  // depending on the child process's PATH lookup.
+  const pdftoppmCmd = deps.pdftoppm.path ?? "pdftoppm";
   const tmpDir = await mkdtemp(join(tmpdir(), "pdf-ocr-"));
   try {
     const pdfPath = join(tmpDir, "input.pdf");
@@ -233,24 +245,50 @@ async function ocrPdfPages(
       ...meta,
       pagesToProcess,
       pagesTotal: pageCount,
+      pdftoppm_path: pdftoppmCmd,
     });
-    const { code, stderr } = await runCommand(
-      "pdftoppm",
-      [
-        "-r",
-        "200",
-        "-f",
-        "1",
-        "-l",
-        String(pagesToProcess),
-        "-png",
-        pdfPath,
-        join(tmpDir, "page"),
-      ],
-      { timeoutMs: 120_000 },
-    );
-    if (code !== 0) {
-      throw new Error(`pdftoppm exited ${code}: ${stderr.slice(0, 500)}`);
+    let rasterCode: number;
+    let rasterStderr: string;
+    try {
+      const r = await runCommand(
+        pdftoppmCmd,
+        [
+          "-r",
+          "200",
+          "-f",
+          "1",
+          "-l",
+          String(pagesToProcess),
+          "-png",
+          pdfPath,
+          join(tmpDir, "page"),
+        ],
+        { timeoutMs: 120_000 },
+      );
+      rasterCode = r.code;
+      rasterStderr = r.stderr;
+    } catch (rasterErr) {
+      const msg =
+        rasterErr instanceof Error ? rasterErr.message : String(rasterErr);
+      const isTimeout = /timed out after/i.test(msg);
+      return {
+        pages: [],
+        pagesProcessed: 0,
+        pagesTotal: pageCount,
+        error: msg,
+        failureCategory: isTimeout ? "extraction_timeout" : "parser_error",
+        pageImages: [],
+      };
+    }
+    if (rasterCode !== 0) {
+      return {
+        pages: [],
+        pagesProcessed: 0,
+        pagesTotal: pageCount,
+        error: `pdftoppm exited ${rasterCode}: ${rasterStderr.slice(0, 500)}`,
+        failureCategory: "parser_error",
+        pageImages: [],
+      };
     }
     const files = (await readdir(tmpDir))
       .filter((f) => f.startsWith("page-") && f.endsWith(".png"))
@@ -311,6 +349,7 @@ async function ocrPdfPages(
       pagesProcessed: files.length,
       pagesTotal: pageCount,
       error: null,
+      failureCategory: null,
       pageImages,
     };
   } catch (err) {
@@ -319,6 +358,7 @@ async function ocrPdfPages(
       pagesProcessed: 0,
       pagesTotal: null,
       error: err instanceof Error ? err.message : String(err),
+      failureCategory: "ocr_failed",
       pageImages: [],
     };
   } finally {
@@ -1785,8 +1825,57 @@ export async function extractAttachmentContent(
 
       // STEP 4: OCR fallback (if enabled & possible)
       if (isOcrEnabled()) {
-        if (!deps?.pdftoppm.available) {
-          // OCR unavailable as environment_error
+        // Re-check dependency state at the OCR decision point so we don't
+        // trust a stale snapshot from earlier in the pipeline. Calling
+        // ensureDependencyReport() returns the cached probe result if one
+        // exists; it's cheap and guarantees we report against current state.
+        processingLog.push(
+          makeLogEntry(
+            messageId,
+            attachmentId,
+            filename,
+            "ocr_dependency_check_started",
+            "pending",
+            startTime,
+          ),
+        );
+        const ocrDeps = await ensureDependencyReport();
+        const pdftoppmAvailable = !!ocrDeps?.pdftoppm.available;
+        const pdftoppmPath = ocrDeps?.pdftoppm.path ?? null;
+        const tesseractAvailable = !!ocrDeps?.tesseract.available;
+        const tesseractPath = ocrDeps?.tesseract.path ?? null;
+        const ocrCapable = !!ocrDeps?.ocr_capable;
+        console.log("[pdf.ocr.dependency_check]", {
+          ...pdfMeta,
+          pdftoppm_available: pdftoppmAvailable,
+          pdftoppm_path: pdftoppmPath,
+          tesseract_available: tesseractAvailable,
+          tesseract_path: tesseractPath,
+          ocr_capable: ocrCapable,
+        });
+        processingLog.push(
+          makeLogEntry(
+            messageId,
+            attachmentId,
+            filename,
+            "ocr_dependency_check_completed",
+            "success",
+            startTime,
+            {
+              error_message: JSON.stringify({
+                pdftoppm_available: pdftoppmAvailable,
+                pdftoppm_path: pdftoppmPath,
+                tesseract_available: tesseractAvailable,
+                tesseract_path: tesseractPath,
+                ocr_capable: ocrCapable,
+              }),
+            },
+          ),
+        );
+
+        if (!pdftoppmAvailable) {
+          // OCR unavailable: pdftoppm really is not installed. Only here
+          // are we permitted to emit ocr_not_configured per the spec.
           const userAction =
             "PDF needs OCR but pdftoppm (poppler-utils) is not installed on the server. Install poppler-utils or run OCR externally.";
           processingLog.push(
@@ -1844,9 +1933,15 @@ export async function extractAttachmentContent(
             processedBuffer,
           };
         }
+        // Track structured failure category from ocrPdfPages so the catch
+        // block below can map it to the correct top-level failure_category
+        // (extraction_timeout / parser_error / ocr_failed) instead of
+        // collapsing every error into "ocr_failed".
+        let ocrFailureCategory: OcrFailureCategory | null = null;
         try {
           const ocr = await ocrPdfPages(workingBuffer, pdfMeta);
           if (ocr.error) {
+            ocrFailureCategory = ocr.failureCategory;
             throw new Error(ocr.error);
           }
           const ocrText = ocr.pages
@@ -1982,7 +2077,21 @@ export async function extractAttachmentContent(
           }
           const userAction = analysis.requires_password
             ? "PDF is password protected. Provide password or remove security manually."
-            : "PDF appears to be a scanned/image-based document and OCR failed. Verify the source document is not corrupt.";
+            : ocrFailureCategory === "extraction_timeout"
+              ? "OCR timed out while rasterising the PDF. Retry, or pre-flatten the document and re-export."
+              : ocrFailureCategory === "parser_error"
+                ? "PDF rasterisation failed. The file may be malformed; verify the source document."
+                : "PDF appears to be a scanned/image-based document and OCR failed. Verify the source document is not corrupt.";
+          // Map structured failure category from ocrPdfPages to the
+          // top-level FailureCategory. environment_error here would be a
+          // race (deps disappeared mid-extraction); fall back to ocr_failed.
+          const mappedFailureCategory: FailureCategory = analysis.requires_password
+            ? "encrypted_or_password_protected"
+            : ocrFailureCategory === "extraction_timeout"
+              ? "extraction_timeout"
+              : ocrFailureCategory === "parser_error"
+                ? "parser_error"
+                : "ocr_failed";
           processingLog.push(
             makeLogEntry(
               messageId,
@@ -1993,7 +2102,7 @@ export async function extractAttachmentContent(
               startTime,
               {
                 extraction_method: "ocr",
-                error_category: "ocr_failed",
+                error_category: mappedFailureCategory,
                 error_message: errMsg,
                 user_action_needed: userAction,
               },
@@ -2007,9 +2116,7 @@ export async function extractAttachmentContent(
               was_downloaded: true,
               extraction_status: "failed",
               skip_reason: null,
-              failure_category: analysis.requires_password
-                ? "encrypted_or_password_protected"
-                : "ocr_failed",
+              failure_category: mappedFailureCategory,
               failure_detail: errMsg,
               user_action_needed: userAction,
               extraction_method: "ocr",
