@@ -1,0 +1,73 @@
+Apply the OCR-only patch described below.
+
+Modify only:
+- artifacts/api-server/src/lib/attachment-extractor.ts
+- artifacts/api-server/src/services/dependencyCheck.ts
+- artifacts/api-server/src/services/pdfSecurityService.ts
+
+Do not modify:
+- export-formatter.ts
+- manifest reconciliation
+- JSON safety
+- Gmail search
+- OAuth
+- frontend
+- database
+- bulk upload
+
+Known problem:
+GET /api/system/dependencies?refresh=1 reports:
+- pdftoppm.available = true
+- pdftoppm.path = valid Nix path
+- tesseract.available = true
+- tesseract.path = valid Nix path
+- qpdf.available = true
+
+But export still reports:
+- failure_category = "ocr_not_configured"
+- failure_detail = "pdftoppm/poppler-utils missing on server"
+- error_message = "pdftoppm missing on server"
+
+Required fix:
+1. In dependencyCheck.ts, ensure DependencyStatus includes:
+- available
+- version
+- path
+- error
+
+2. Ensure dependencyCheck resolves binary paths and exposes:
+- deps.pdftoppm.path
+- deps.tesseract.path
+- deps.qpdf.path
+
+3. In attachment-extractor.ts:
+- ocr_not_configured may only be emitted when deps.pdftoppm.available === false
+- if deps.pdftoppm.available === true, do not return the "pdftoppm missing on server" failure
+- use:
+  const pdftoppmCmd = deps.pdftoppm.path ?? "pdftoppm"
+  const tesseractCmd = deps.tesseract.path ?? "tesseract"
+
+4. If pdftoppm or tesseract execution fails while available=true:
+- classify as "ocr_failed"
+- include actual stderr/error text
+- do not classify as ocr_not_configured
+
+5. In pdfSecurityService.ts:
+- update convertPdfToImages so it can accept and use a resolved pdftoppm command/path
+- do not call bare "pdftoppm" if a resolved path is supplied
+
+6. Add processing log event:
+ocr_failure_classified
+
+Include:
+- pdftoppm_available
+- pdftoppm_path
+- tesseract_available
+- tesseract_path
+- chosen_failure_category
+- actual_error_message
+
+Acceptance:
+- pnpm --filter @workspace/api-server build passes
+- when /api/system/dependencies?refresh=1 reports pdftoppm.available=true, export must not produce ocr_not_configured
+- export must not say "pdftoppm missing on server" unless pdftoppm.available=false in the same export path

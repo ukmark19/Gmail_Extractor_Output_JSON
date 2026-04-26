@@ -243,6 +243,10 @@ async function ocrPdfPages(
   // the same binary surfaced by GET /api/system/dependencies, instead of
   // depending on the child process's PATH lookup.
   const pdftoppmCmd = deps.pdftoppm.path ?? "pdftoppm";
+  // tesseract OCR is performed via the bundled tesseract.js wasm
+  // (no system spawn), but we still resolve the system tesseract path
+  // for diagnostics so failures can be triaged against the dep probe.
+  const tesseractCmd = deps.tesseract.path ?? "tesseract";
   const tmpDir = await mkdtemp(join(tmpdir(), "pdf-ocr-"));
   try {
     const pdfPath = join(tmpDir, "input.pdf");
@@ -256,6 +260,7 @@ async function ocrPdfPages(
       pagesToProcess,
       pagesTotal: pageCount,
       pdftoppm_path: pdftoppmCmd,
+      tesseract_path: tesseractCmd,
     });
     let rasterCode: number;
     let rasterStderr: string;
@@ -2057,7 +2062,9 @@ export async function extractAttachmentContent(
         } catch (ocrErr) {
           const errMsg =
             ocrErr instanceof Error ? ocrErr.message : String(ocrErr);
-          // Try last-resort image conversion
+          // Try last-resort image conversion. Pass the resolved pdftoppm
+          // path so this fallback spawns the SAME binary the dependency
+          // probe surfaced — never a bare PATH lookup.
           let imagesRendered = 0;
           try {
             const tmp = await mkdtemp(join(tmpdir(), "pdf-img-ref-"));
@@ -2066,6 +2073,7 @@ export async function extractAttachmentContent(
             const conv = await convertPdfToImages(inP, {
               dpi: 150,
               maxPages: OCR_MAX_PAGES,
+              pdftoppmCmd: pdftoppmPath,
             });
             if (conv.success) {
               imagesRendered = conv.image_paths.length;
@@ -2102,6 +2110,32 @@ export async function extractAttachmentContent(
               : ocrFailureCategory === "parser_error"
                 ? "parser_error"
                 : "ocr_failed";
+          // Diagnostic event so the manifest's processing_log captures
+          // the dep-probe state at the moment the OCR failure was
+          // classified — proving definitively that the failure was NOT
+          // ocr_not_configured when pdftoppm.available === true.
+          processingLog.push(
+            makeLogEntry(
+              messageId,
+              attachmentId,
+              filename,
+              "ocr_failure_classified",
+              "failed",
+              startTime,
+              {
+                extraction_method: "ocr",
+                error_category: mappedFailureCategory,
+                error_message: JSON.stringify({
+                  pdftoppm_available: pdftoppmAvailable,
+                  pdftoppm_path: pdftoppmPath,
+                  tesseract_available: tesseractAvailable,
+                  tesseract_path: tesseractPath,
+                  chosen_failure_category: mappedFailureCategory,
+                  actual_error_message: errMsg,
+                }),
+              },
+            ),
+          );
           processingLog.push(
             makeLogEntry(
               messageId,

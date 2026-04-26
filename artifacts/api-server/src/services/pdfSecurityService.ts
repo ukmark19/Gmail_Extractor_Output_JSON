@@ -273,12 +273,21 @@ export async function attemptPdfUnlock(
 /**
  * Convert PDF pages to PNG images via pdftoppm (poppler).
  * Returns absolute paths to images in page order. Caller owns cleanup of `output_dir`.
+ *
+ * `pdftoppmCmd` (when supplied) lets the caller spawn the exact resolved
+ * binary surfaced by the dependency probe (e.g. an absolute Nix-store path)
+ * instead of relying on the child process's PATH lookup. Falls back to the
+ * bare command name `"pdftoppm"` only when no resolved path is provided.
  */
 export async function convertPdfToImages(
   pdfPath: string,
-  options: { dpi?: number; maxPages?: number } = {},
+  options: { dpi?: number; maxPages?: number; pdftoppmCmd?: string | null } = {},
 ): Promise<ImageConversionResult> {
   const dpi = options.dpi ?? 200;
+  const pdftoppmCmd =
+    options.pdftoppmCmd && options.pdftoppmCmd.length > 0
+      ? options.pdftoppmCmd
+      : "pdftoppm";
   const dir = await mkdtemp(join(tmpdir(), "pdf-img-"));
   try {
     const args = ["-r", String(dpi)];
@@ -286,7 +295,7 @@ export async function convertPdfToImages(
       args.push("-f", "1", "-l", String(options.maxPages));
     }
     args.push("-png", pdfPath, join(dir, "page"));
-    const { code, stderr } = await runCommand("pdftoppm", args, {
+    const { code, stderr } = await runCommand(pdftoppmCmd, args, {
       timeoutMs: 120_000,
     });
     if (code !== 0) {
