@@ -1,0 +1,77 @@
+Fix the remaining OCR false-negative bug in attachment-extractor.ts.
+
+Confirmed:
+GET /api/system/dependencies?refresh=1 returns:
+- pdftoppm.available = true
+- pdftoppm.path is a valid Nix path
+- tesseract.available = true
+- qpdf.available = true
+- ocr_capable = true
+
+But export still produces:
+- failure_category = "ocr_not_configured"
+- failure_detail = "pdftoppm/poppler-utils missing on server"
+- processing log event: attachment_extraction_failed, extraction_method = "ocr", error_message = "pdftoppm missing on server"
+
+This is now a false-negative in the OCR branch.
+
+Modify only:
+artifacts/api-server/src/lib/attachment-extractor.ts
+
+Do not modify:
+- dependencyCheck.ts
+- export-formatter.ts
+- manifest reconciliation
+- JSON safety
+- Gmail search
+- OAuth
+- frontend
+- database
+
+Tasks:
+
+1. Find every branch in attachment-extractor.ts that sets:
+- failure_category: "ocr_not_configured"
+- failure_detail: "pdftoppm/poppler-utils missing on server"
+- error_message: "pdftoppm missing on server"
+- user_action_needed mentioning poppler-utils missing
+
+2. Immediately before each such branch, call:
+const deps = await ensureDependencyReport();
+
+3. If deps.pdftoppm.available === true:
+- do NOT return ocr_not_configured
+- continue to rasterize PDF using pdftoppm
+- use deps.pdftoppm.path ?? "pdftoppm" as the command
+
+4. If deps.tesseract.available === true:
+- use deps.tesseract.path ?? "tesseract"
+
+5. Add processing log events around the decision:
+- ocr_dependency_check_started
+- ocr_dependency_check_completed
+
+Include in the completed event:
+- pdftoppm_available
+- pdftoppm_path
+- tesseract_available
+- tesseract_path
+- ocr_capable
+
+6. Rename false dependency errors:
+Only use "ocr_not_configured" when deps.pdftoppm.available === false.
+If pdftoppm runs and fails, classify as:
+- parser_error for rasterisation failure
+or
+- ocr_failed for OCR failure
+with actual stderr/error text.
+
+7. Acceptance:
+- /api/system/dependencies?refresh=1 still returns pdftoppm.available = true
+- running the same export must no longer produce "pdftoppm missing on server"
+- ocr_not_configured must be 0 when pdftoppm.available = true
+- any remaining failed PDFs must show real OCR/rasterisation errors, not missing dependency errors
+
+After changes:
+Run:
+pnpm --filter @workspace/api-server build
