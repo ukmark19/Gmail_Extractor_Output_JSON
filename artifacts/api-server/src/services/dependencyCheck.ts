@@ -1,9 +1,30 @@
 import { spawn } from "child_process";
+import { promisify } from "util";
+import { execFile as execFileCb } from "child_process";
+
+const execFile = promisify(execFileCb);
 
 export interface DependencyStatus {
   available: boolean;
   version: string | null;
+  /**
+   * Absolute filesystem path to the resolved binary (via `which`),
+   * or null if the binary cannot be located on PATH. Surfaced so
+   * deployment-time logs make it obvious WHICH copy of the tool was
+   * picked up (Nix store path vs system path vs missing).
+   */
+  path: string | null;
   error: string | null;
+}
+
+async function resolveBinaryPath(cmd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFile("which", [cmd]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    return null;
+  }
 }
 
 export interface DependencyReport {
@@ -22,6 +43,10 @@ let cachedReport: DependencyReport | null = null;
 
 function check(cmd: string, versionArg: string): Promise<DependencyStatus> {
   return new Promise((resolve) => {
+    const finish = async (partial: Omit<DependencyStatus, "path">) => {
+      const path = partial.available ? await resolveBinaryPath(cmd) : null;
+      resolve({ ...partial, path });
+    };
     try {
       const child = spawn(cmd, [versionArg]);
       let out = "";
@@ -29,7 +54,7 @@ function check(cmd: string, versionArg: string): Promise<DependencyStatus> {
       child.stdout.on("data", (c: Buffer) => (out += c.toString("utf8")));
       child.stderr.on("data", (c: Buffer) => (err += c.toString("utf8")));
       child.on("error", (e) =>
-        resolve({ available: false, version: null, error: e.message }),
+        void finish({ available: false, version: null, error: e.message }),
       );
       child.on("close", (code) => {
         const text = (out + "\n" + err).trim();
@@ -38,11 +63,11 @@ function check(cmd: string, versionArg: string): Promise<DependencyStatus> {
         // Most tools exit 0; tesseract --version exits 0; qpdf --version exits 0; pdftoppm -v exits 99.
         // Treat any case where we got a version string as available.
         if (version) {
-          resolve({ available: true, version, error: null });
+          void finish({ available: true, version, error: null });
         } else if (code === 0) {
-          resolve({ available: true, version: null, error: null });
+          void finish({ available: true, version: null, error: null });
         } else {
-          resolve({
+          void finish({
             available: false,
             version: null,
             error: text.slice(0, 200) || `exit ${code}`,
@@ -50,7 +75,7 @@ function check(cmd: string, versionArg: string): Promise<DependencyStatus> {
         }
       });
     } catch (e) {
-      resolve({
+      void finish({
         available: false,
         version: null,
         error: e instanceof Error ? e.message : String(e),
@@ -110,22 +135,24 @@ export async function ensureDependencyReport(): Promise<DependencyReport> {
 }
 
 export function logDependencyReport(report: DependencyReport): void {
+  // Render `ok (version) @ path` so deployment-time logs show both
+  // the version string and the resolved binary path. This is the
+  // single line operators inspect when triaging
+  // "pdftoppm/poppler-utils missing on server"-style failures.
+  const fmt = (label: string, s: DependencyStatus, missingMsg?: string) =>
+    s.available
+      ? `ok (${s.version ?? "unknown"})${s.path ? " @ " + s.path : ""}`
+      : missingMsg ?? `MISSING: ${s.error}`;
   console.log("[deps.report]", {
-    pdftoppm: report.pdftoppm.available
-      ? `ok (${report.pdftoppm.version ?? "unknown"})`
-      : `MISSING: ${report.pdftoppm.error}`,
-    pdftotext: report.pdftotext.available
-      ? `ok (${report.pdftotext.version ?? "unknown"})`
-      : `MISSING: ${report.pdftotext.error}`,
-    pdfinfo: report.pdfinfo.available
-      ? `ok (${report.pdfinfo.version ?? "unknown"})`
-      : `MISSING: ${report.pdfinfo.error}`,
-    qpdf: report.qpdf.available
-      ? `ok (${report.qpdf.version ?? "unknown"})`
-      : `MISSING: ${report.qpdf.error}`,
-    tesseract: report.tesseract.available
-      ? `ok (${report.tesseract.version ?? "unknown"})`
-      : `bundled-js (system tesseract not used)`,
+    pdftoppm: fmt("pdftoppm", report.pdftoppm),
+    pdftotext: fmt("pdftotext", report.pdftotext),
+    pdfinfo: fmt("pdfinfo", report.pdfinfo),
+    qpdf: fmt("qpdf", report.qpdf),
+    tesseract: fmt(
+      "tesseract",
+      report.tesseract,
+      "bundled-js (system tesseract not used)",
+    ),
     ocr_capable: report.ocr_capable,
     pdf_security_capable: report.pdf_security_capable,
     pdf_page_text_capable: report.pdf_page_text_capable,
