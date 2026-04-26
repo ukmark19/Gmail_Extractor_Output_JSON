@@ -89,7 +89,11 @@ async function runCommand(
     });
     child.on("close", (code) => {
       if (timer) clearTimeout(timer);
-      resolve({ stdout: Buffer.concat(stdoutChunks), stderr, code: code ?? -1 });
+      resolve({
+        stdout: Buffer.concat(stdoutChunks),
+        stderr,
+        code: code ?? -1,
+      });
     });
     if (opts.input) {
       child.stdin.end(opts.input);
@@ -129,7 +133,11 @@ async function getPdfPageCount(buffer: Buffer): Promise<number | null> {
 async function extractPdfPages(
   buffer: Buffer,
   knownPageCount: number | null,
-): Promise<{ pages: PageRecord[]; method: "pdftotext" | "pdf_parse_split"; error: string | null }> {
+): Promise<{
+  pages: PageRecord[];
+  method: "pdftotext" | "pdf_parse_split";
+  error: string | null;
+}> {
   const pageCount = knownPageCount ?? (await getPdfPageCount(buffer));
   if (!pageCount || pageCount <= 0) {
     return { pages: [], method: "pdftotext", error: "page count unknown" };
@@ -228,13 +236,14 @@ async function ocrPdfPages(
   // Always await — `getDependencyReport()` returns null until the startup
   // probe completes, which would falsely surface as "pdftoppm missing".
   const deps = await ensureDependencyReport();
-  
+
   if (!deps?.pdftoppm.available) {
     return {
       pages: [],
       pagesProcessed: 0,
       pagesTotal: null,
-      error: "pdftoppm (poppler-utils) not installed — cannot rasterize for OCR",
+      error:
+        "pdftoppm (poppler-utils) not installed — cannot rasterize for OCR",
       failureCategory: "environment_error",
       pageImages: [],
     };
@@ -1226,7 +1235,9 @@ export async function extractAttachmentContent(
           const ct = (att.contentType || "").toLowerCase();
           const fn = (att.filename || "").toLowerCase();
           const isNested =
-            ct === "message/rfc822" || fn.endsWith(".eml") || fn.endsWith(".msg");
+            ct === "message/rfc822" ||
+            fn.endsWith(".eml") ||
+            fn.endsWith(".msg");
           if (isNested && att.content && Buffer.isBuffer(att.content)) {
             try {
               await walk(att.content, docId, depth + 1);
@@ -1600,7 +1611,8 @@ export async function extractAttachmentContent(
       const deps = await ensureDependencyReport();
 
       console.log("[pdf.analyze.started]", pdfMeta);
-      const analysis: PdfSecurityAnalysis = await analyzePdfSecurity(attachmentData);
+      const analysis: PdfSecurityAnalysis =
+        await analyzePdfSecurity(attachmentData);
       console.log("[pdf.analyze.completed]", {
         ...pdfMeta,
         is_encrypted: analysis.is_encrypted,
@@ -1721,7 +1733,8 @@ export async function extractAttachmentContent(
                   resolvedPageCount = retried.numpages;
                 }
               } catch (rerr) {
-                parseError = rerr instanceof Error ? rerr.message : String(rerr);
+                parseError =
+                  rerr instanceof Error ? rerr.message : String(rerr);
               }
             } else {
               unlockStatus = "failed";
@@ -1889,26 +1902,34 @@ export async function extractAttachmentContent(
         );
 
         if (!pdftoppmAvailable) {
-          // OCR unavailable: pdftoppm really is not installed. Only here
-          // are we permitted to emit ocr_not_configured per the spec.
-          const userAction =
-            "PDF needs OCR but pdftoppm (poppler-utils) is not installed on the server. Install poppler-utils or run OCR externally.";
+          const actualError =
+            `OCR unavailable in this export path. Dependency snapshot: ` +
+            `pdftoppm_available=${pdftoppmAvailable}, ` +
+            `pdftoppm_path=${pdftoppmPath ?? "null"}, ` +
+            `tesseract_available=${tesseractAvailable}, ` +
+            `tesseract_path=${tesseractPath ?? "null"}, ` +
+            `ocr_capable=${ocrCapable}`;
+
+          const chosenFailureCategory: FailureCategory = "ocr_failed";
+
           processingLog.push(
             makeLogEntry(
               messageId,
               attachmentId,
               filename,
-              "attachment_extraction_failed",
+              "ocr_failure_classified",
               "failed",
               startTime,
               {
                 extraction_method: "ocr",
-                error_category: "ocr_not_configured",
-                error_message: "pdftoppm missing on server",
-                user_action_needed: userAction,
+                error_category: chosenFailureCategory,
+                error_message: actualError,
+                user_action_needed:
+                  "OCR dependency check failed inside the export path despite system dependency endpoint. Review dependency snapshot in processing log.",
               },
             ),
           );
+
           return {
             result: {
               ...base,
@@ -1917,9 +1938,10 @@ export async function extractAttachmentContent(
               was_downloaded: true,
               extraction_status: "failed",
               skip_reason: null,
-              failure_category: "ocr_not_configured",
-              failure_detail: "pdftoppm/poppler-utils missing on server",
-              user_action_needed: userAction,
+              failure_category: chosenFailureCategory,
+              failure_detail: actualError,
+              user_action_needed:
+                "OCR dependency check failed inside the export path despite system dependency endpoint. Review dependency snapshot in processing log.",
               extraction_method: "none",
               text_extracted: false,
               text_quality: "unknown",
@@ -1933,7 +1955,8 @@ export async function extractAttachmentContent(
               fallback_used: false,
               fallback_method: null,
               pages,
-              pages_extracted_count: pages.filter((p) => p.text_extracted).length,
+              pages_extracted_count: pages.filter((p) => p.text_extracted)
+                .length,
               pages_failed_count: pages.filter((p) => !p.text_extracted).length,
               contains_structured_data: false,
               structured_data_type: "none",
@@ -1942,8 +1965,13 @@ export async function extractAttachmentContent(
               extracted_text: null,
               structured_data: null,
               warnings,
-              errors: pagesError ? [...errors, pagesError] : errors,
+              errors,
             },
+            // Persist the raw + processed bytes EVEN on the OCR-missing
+            // failure path. The bytes are still useful: we still want
+            // them in the ZIP under attachments/ so the user can manually
+            // OCR locally. Returning null/missing here would silently
+            // drop the file from the export (the previous regression).
             buffer: attachmentData,
             processedBuffer,
           };
@@ -2021,7 +2049,8 @@ export async function extractAttachmentContent(
               attachment_role: "document",
               is_supported: true,
               was_downloaded: true,
-              extraction_status: ocrConfidence === "low" ? "partial" : "success",
+              extraction_status:
+                ocrConfidence === "low" ? "partial" : "success",
               skip_reason: null,
               failure_category: null,
               failure_detail: null,
@@ -2029,7 +2058,8 @@ export async function extractAttachmentContent(
                 ocrConfidence === "low"
                   ? "OCR returned low-confidence text. Verify accuracy if it matters."
                   : null,
-              extraction_method: parsedText.length > 0 ? "pdf_parser+ocr" : "ocr",
+              extraction_method:
+                parsedText.length > 0 ? "pdf_parser+ocr" : "ocr",
               text_extracted: true,
               text_quality: ocrConfidence,
               is_encrypted: isEncryptedFlag,
@@ -2103,13 +2133,14 @@ export async function extractAttachmentContent(
           // Map structured failure category from ocrPdfPages to the
           // top-level FailureCategory. environment_error here would be a
           // race (deps disappeared mid-extraction); fall back to ocr_failed.
-          const mappedFailureCategory: FailureCategory = analysis.requires_password
-            ? "encrypted_or_password_protected"
-            : ocrFailureCategory === "extraction_timeout"
-              ? "extraction_timeout"
-              : ocrFailureCategory === "parser_error"
-                ? "parser_error"
-                : "ocr_failed";
+          const mappedFailureCategory: FailureCategory =
+            analysis.requires_password
+              ? "encrypted_or_password_protected"
+              : ocrFailureCategory === "extraction_timeout"
+                ? "extraction_timeout"
+                : ocrFailureCategory === "parser_error"
+                  ? "parser_error"
+                  : "ocr_failed";
           // Diagnostic event so the manifest's processing_log captures
           // the dep-probe state at the moment the OCR failure was
           // classified — proving definitively that the failure was NOT
@@ -2176,7 +2207,8 @@ export async function extractAttachmentContent(
               fallback_used: imagesRendered > 0,
               fallback_method: imagesRendered > 0 ? "pdf_to_images" : "ocr",
               pages,
-              pages_extracted_count: pages.filter((p) => p.text_extracted).length,
+              pages_extracted_count: pages.filter((p) => p.text_extracted)
+                .length,
               pages_failed_count: pages.filter((p) => !p.text_extracted).length,
               contains_structured_data: false,
               structured_data_type: "none",
@@ -2229,7 +2261,8 @@ export async function extractAttachmentContent(
           extraction_status: "failed",
           skip_reason: null,
           failure_category: failCategory,
-          failure_detail: parseError ?? "pdf-parse produced no text and OCR disabled.",
+          failure_detail:
+            parseError ?? "pdf-parse produced no text and OCR disabled.",
           user_action_needed: userActionDisabled,
           extraction_method: "pdf_parser",
           text_extracted: false,
@@ -2271,7 +2304,8 @@ export async function extractAttachmentContent(
       try {
         result = await mammoth.extractRawText({ buffer: attachmentData });
       } catch (docxErr) {
-        const errMsg = docxErr instanceof Error ? docxErr.message : String(docxErr);
+        const errMsg =
+          docxErr instanceof Error ? docxErr.message : String(docxErr);
         const isEncrypted =
           errMsg.toLowerCase().includes("encrypt") ||
           errMsg.toLowerCase().includes("password");
@@ -2373,7 +2407,8 @@ export async function extractAttachmentContent(
       try {
         workbook = XLSX.read(attachmentData, { type: "buffer" });
       } catch (xlsxErr) {
-        const errMsg = xlsxErr instanceof Error ? xlsxErr.message : String(xlsxErr);
+        const errMsg =
+          xlsxErr instanceof Error ? xlsxErr.message : String(xlsxErr);
         const isEncrypted =
           errMsg.toLowerCase().includes("encrypt") ||
           errMsg.toLowerCase().includes("password");

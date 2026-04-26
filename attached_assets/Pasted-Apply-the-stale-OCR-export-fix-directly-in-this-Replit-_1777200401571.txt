@@ -1,0 +1,60 @@
+Apply the stale OCR export fix directly in this Replit workspace.
+
+Modify only:
+- artifacts/api-server/src/lib/attachment-extractor.ts
+- artifacts/api-server/src/services/dependencyCheck.ts
+- artifacts/api-server/src/services/pdfSecurityService.ts
+- artifacts/api-server/src/lib/export-zip.ts
+- artifacts/api-server/src/routes/export.ts
+
+Do not modify:
+- frontend
+- Gmail search
+- OAuth
+- database
+- manifest reconciliation
+- JSON safety rules except where needed for build_marker handling
+
+Known root cause:
+1. /api/gmail/export/latest can return an old persisted ZIP from:
+exports/users/<userId>/latest/latest.zip
+
+2. Current source may still contain the old hardcoded OCR message:
+"pdftoppm/poppler-utils missing on server"
+
+Required fix:
+1. Add build_marker = "ocr-runtime-fix-v1" to every newly generated export processing log.
+
+2. When persisting latest exports, write a sidecar:
+build_marker.json
+containing:
+{
+  "build_marker": "ocr-runtime-fix-v1",
+  "export_id": "...",
+  "created_at": "..."
+}
+
+3. Update GET/HEAD /api/gmail/export/latest:
+- if latest.zip exists but build_marker.json is missing, return HTTP 409
+- if build_marker.json exists but build_marker is not "ocr-runtime-fix-v1", return HTTP 409
+- do not serve stale latest.zip silently
+
+4. In attachment-extractor.ts:
+- remove/replace the hardcoded old OCR failure text:
+  "pdftoppm/poppler-utils missing on server"
+  "pdftoppm missing on server"
+- ocr_not_configured may only be used when deps.pdftoppm.available === false
+- if deps.pdftoppm.available === true but pdftoppm/tesseract execution fails, classify as "ocr_failed" and include actual stderr/error text
+
+5. In pdfSecurityService.ts:
+- use resolved binary paths where supplied
+- do not call bare pdftoppm if a resolved pdftoppm path is available
+
+6. Build must pass:
+pnpm --filter @workspace/api-server build
+
+Acceptance:
+- grep -R "pdftoppm/poppler-utils missing on server" -n artifacts/api-server/src should not find runtime source branches
+- grep -R "pdftoppm missing on server" -n artifacts/api-server/src should not find runtime source branches
+- /api/gmail/export/latest should not return stale latest.zip without a matching build_marker.json
+- new exports include build_marker "ocr-runtime-fix-v1"

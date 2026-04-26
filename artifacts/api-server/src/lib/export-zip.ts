@@ -1,9 +1,29 @@
 import archiver, { type Archiver } from "archiver";
 import type { Writable } from "stream";
 import { createWriteStream, existsSync, mkdirSync } from "node:fs";
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
+
+/**
+ * Single source of truth for the export build marker. Bumped any time a
+ * runtime change must invalidate previously persisted `latest.zip` copies
+ * (so the /api/gmail/export/latest endpoint refuses to serve a stale
+ * artifact whose sidecar is missing or carries an older marker).
+ *
+ * Currently bumped for: OCR runtime path resolution + dependency-probe
+ * gating fix.
+ */
+export const EXPORT_BUILD_MARKER = "ocr-runtime-fix-v1" as const;
+
+/** Sidecar filename written next to latest.zip in the per-user latest dir. */
+export const BUILD_MARKER_SIDECAR_FILENAME = "build_marker.json";
+
+export interface BuildMarkerSidecar {
+  build_marker: string;
+  export_id: string;
+  created_at: string;
+}
 
 export interface AttachmentBufferEntry {
   storagePath: string; // e.g. extracted_attachments/<msg>/<...>
@@ -244,11 +264,24 @@ export interface DiskPersistOptions {
   exportsRoot: string;
   exportTimestamp: string; // safe-for-filesystem timestamp string
   zipFilename: string;
+  /**
+   * Export id propagated into the build_marker.json sidecar so operators
+   * can correlate the persisted latest.zip with the export run that
+   * produced it.
+   */
+  exportId: string;
 }
 
 export interface DiskPersistResult {
   timestampedPath: string;
   latestPath: string;
+  /**
+   * Absolute path to the build_marker.json sidecar written next to
+   * latest.zip. Always populated after a successful tee — the
+   * /api/gmail/export/latest endpoint refuses to serve latest.zip
+   * unless this file exists and contains the current EXPORT_BUILD_MARKER.
+   */
+  buildMarkerPath: string;
 }
 
 export async function streamExportZipWithDiskTee(
@@ -289,16 +322,66 @@ export async function streamExportZipWithDiskTee(
 
   await fileDone;
 
-  // Best-effort: copy the timestamped artifact to latest.zip. If this fails
-  // we still return the timestamped path — the export itself is not lost.
+  const buildMarkerPath = join(latestDir, BUILD_MARKER_SIDECAR_FILENAME);
+
+  // Atomically publish latest.zip + build_marker.json.
+  //
+  // ORDERING (critical for correctness — closes a TOCTOU window where a
+  // concurrent reader could observe a stale sidecar paired with a fresh
+  // half-written zip, or vice versa):
+  //
+  //   1. Wipe any pre-existing sidecar so /latest immediately rejects
+  //      reads while the new copy is in flight (better to 409 than to
+  //      serve an inconsistent pair).
+  //   2. Copy ts -> latest.tmp.zip (a sibling of latest.zip).
+  //   3. Atomically rename latest.tmp.zip -> latest.zip. On POSIX,
+  //      rename within the same dir is atomic; readers either see the
+  //      old zip or the new zip, never a partial one.
+  //   4. Write the sidecar via temp+rename so concurrent readers never
+  //      observe a half-written JSON file.
+  //
+  // The whole sequence is best-effort: if any step throws we leave the
+  // latest dir in a 409-rejecting state (no sidecar) rather than a
+  // half-published one.
   try {
     if (!existsSync(dirname(latestPath))) {
       mkdirSync(dirname(latestPath), { recursive: true });
     }
-    await copyFile(tsPath, latestPath);
+    if (existsSync(buildMarkerPath)) {
+      const { unlink } = await import("node:fs/promises");
+      try {
+        await unlink(buildMarkerPath);
+      } catch (err) {
+        // Only ENOENT is benign (the file disappeared between the
+        // existsSync check and the unlink — fine, target state already
+        // achieved). Any other error (EACCES, EBUSY, etc.) means we
+        // CANNOT guarantee the rejecting-state invariant if a later
+        // step then succeeds, so we propagate to the outer catch,
+        // which leaves the publish unfinished and the latest dir in a
+        // safe state.
+        const code = (err as NodeJS.ErrnoException | undefined)?.code;
+        if (code !== "ENOENT") throw err;
+      }
+    }
+    const tmpZip = `${latestPath}.tmp`;
+    await copyFile(tsPath, tmpZip);
+    await rename(tmpZip, latestPath);
+    const sidecar: BuildMarkerSidecar = {
+      build_marker: EXPORT_BUILD_MARKER,
+      export_id: disk.exportId,
+      created_at: new Date().toISOString(),
+    };
+    const tmpSidecar = `${buildMarkerPath}.tmp`;
+    await writeFile(tmpSidecar, JSON.stringify(sidecar, null, 2), "utf8");
+    await rename(tmpSidecar, buildMarkerPath);
   } catch {
     // swallow — caller can decide via the returned object
   }
 
-  return { ...result, timestampedPath: tsPath, latestPath };
+  return {
+    ...result,
+    timestampedPath: tsPath,
+    latestPath,
+    buildMarkerPath,
+  };
 }

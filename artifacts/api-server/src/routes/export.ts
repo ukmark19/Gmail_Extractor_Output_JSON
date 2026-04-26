@@ -22,14 +22,17 @@ import {
 } from "../lib/attachment-extractor.js";
 import {
   streamExportZipWithDiskTee,
+  EXPORT_BUILD_MARKER,
+  BUILD_MARKER_SIDECAR_FILENAME,
   type AttachmentBufferEntry,
+  type BuildMarkerSidecar,
   type OcrImageEntry,
   type SerializedBundleEntries,
 } from "../lib/export-zip.js";
 import { SafeJsonError, serializeJsonSafe } from "../lib/safe-json.js";
 import { createReadStream, existsSync, statSync } from "node:fs";
-import { stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 
 const router: IRouter = Router();
 
@@ -49,6 +52,90 @@ function userExportsRoot(userId: number): string {
 
 function userLatestZipPath(userId: number): string {
   return join(userExportsRoot(userId), "latest", "latest.zip");
+}
+
+/**
+ * Inspect the per-user latest dir and report whether the persisted
+ * latest.zip is paired with a build_marker.json sidecar carrying the
+ * CURRENT EXPORT_BUILD_MARKER. Used by GET/HEAD /api/gmail/export/latest
+ * to refuse serving a ZIP whose provenance can't be vouched for.
+ *
+ * Returns one of:
+ *   - { kind: "ok", sidecar }: latest.zip is safe to serve
+ *   - { kind: "missing_zip" }: nothing has ever been exported by this user
+ *   - { kind: "missing_sidecar", reason }: latest.zip exists but the
+ *       sidecar isn't present (e.g. zip persisted by an older build, or
+ *       sidecar write failed mid-tee) — caller should respond 409
+ *   - { kind: "stale_marker", actual, expected, sidecar }: sidecar
+ *       present but its build_marker doesn't match the running build —
+ *       caller should respond 409
+ *   - { kind: "malformed_sidecar", reason }: sidecar is unreadable or
+ *       not parseable as the expected JSON shape — caller should respond
+ *       409 (treated like missing for safety)
+ */
+type LatestValidation =
+  | { kind: "ok"; sidecar: BuildMarkerSidecar }
+  | { kind: "missing_zip" }
+  | { kind: "missing_sidecar"; reason: string }
+  | {
+      kind: "stale_marker";
+      actual: string;
+      expected: string;
+      sidecar: BuildMarkerSidecar;
+    }
+  | { kind: "malformed_sidecar"; reason: string };
+
+async function validateLatestExport(userId: number): Promise<LatestValidation> {
+  const latestPath = userLatestZipPath(userId);
+  if (!existsSync(latestPath)) return { kind: "missing_zip" };
+  const sidecarPath = join(dirname(latestPath), BUILD_MARKER_SIDECAR_FILENAME);
+  if (!existsSync(sidecarPath)) {
+    return {
+      kind: "missing_sidecar",
+      reason: "build_marker_sidecar_absent",
+    };
+  }
+  // Reasons below are short, fixed identifier strings — never raw error
+  // messages — so 409 responses can't leak filesystem paths or internal
+  // exception text to the browser. Detailed diagnostics are logged
+  // server-side instead.
+  let raw: string;
+  try {
+    raw = await readFile(sidecarPath, "utf8");
+  } catch (err) {
+    console.warn(
+      "[export.latest.validate] failed to read build_marker sidecar",
+      { userId, error: err instanceof Error ? err.message : String(err) },
+    );
+    return { kind: "malformed_sidecar", reason: "sidecar_unreadable" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    console.warn(
+      "[export.latest.validate] build_marker sidecar is not valid JSON",
+      { userId, error: err instanceof Error ? err.message : String(err) },
+    );
+    return { kind: "malformed_sidecar", reason: "sidecar_invalid_json" };
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    typeof (parsed as { build_marker?: unknown }).build_marker !== "string"
+  ) {
+    return { kind: "malformed_sidecar", reason: "sidecar_missing_field" };
+  }
+  const sidecar = parsed as BuildMarkerSidecar;
+  if (sidecar.build_marker !== EXPORT_BUILD_MARKER) {
+    return {
+      kind: "stale_marker",
+      actual: sidecar.build_marker,
+      expected: EXPORT_BUILD_MARKER,
+      sidecar,
+    };
+  }
+  return { kind: "ok", sidecar };
 }
 
 async function requireAuth(
@@ -111,6 +198,20 @@ router.post(
     // Diagnostics buffer that grows BEFORE the validated payload is even
     // available, so we can attribute parse failures to a specific request.
     const processingLog: ProcessingLogEntry[] = [];
+
+    // Provenance: stamp the build marker into the processing log as the
+    // VERY FIRST entry so any persisted processing_log.json carries an
+    // unambiguous record of which runtime build produced it. Operators
+    // can grep for "build_marker_recorded" to confirm a specific export
+    // came from the post-OCR-fix codebase rather than a stale ZIP.
+    processingLog.push(
+      makeLog("", null, null, "build_marker_recorded", "ok", {
+        error_message: JSON.stringify({
+          build_marker: EXPORT_BUILD_MARKER,
+          recorded_at: new Date().toISOString(),
+        }),
+      }),
+    );
 
     // Snapshot of the raw payload shape (NEVER include actual ids in logs in
     // production-leaning detail; we log lengths + types so the user can
@@ -1088,6 +1189,10 @@ router.post(
             exportsRoot: userExportsRoot(session.userId!),
             exportTimestamp: ts,
             zipFilename,
+            // Surfaced into the build_marker.json sidecar written next
+            // to latest.zip so /latest readers can correlate the served
+            // ZIP with the export run that produced it.
+            exportId: bundle.exportId,
           },
         );
         // After-the-fact log so the saved processing_log inside this run does
@@ -1136,8 +1241,39 @@ router.get(
     }
     // Resolve to the requester's own latest.zip — never another user's.
     const latestPath = userLatestZipPath(session.userId);
-    if (!existsSync(latestPath)) {
+    // Provenance gate: refuse to serve latest.zip unless its
+    // build_marker.json sidecar matches the running EXPORT_BUILD_MARKER.
+    // This is the explicit fix for stale latest.zip files persisted by
+    // older builds that contained the obsolete OCR error text — those
+    // ZIPs have no sidecar and so will be rejected here with 409, forcing
+    // the user to re-export under the current code path.
+    const validation = await validateLatestExport(session.userId);
+    if (validation.kind === "missing_zip") {
       res.status(404).json({ error: "No export has been generated yet" });
+      return;
+    }
+    if (
+      validation.kind === "missing_sidecar" ||
+      validation.kind === "malformed_sidecar"
+    ) {
+      // `reason` is one of a small fixed set of identifier strings
+      // (see validateLatestExport) — no raw filesystem paths or
+      // exception text leaks through to the client.
+      res.status(409).json({
+        error: "Latest export is stale; please re-run the export.",
+        reason: validation.reason,
+        expected_build_marker: EXPORT_BUILD_MARKER,
+      });
+      return;
+    }
+    if (validation.kind === "stale_marker") {
+      res.status(409).json({
+        error: "Latest export was generated by an older build; please re-run the export.",
+        actual_build_marker: validation.actual,
+        expected_build_marker: validation.expected,
+        sidecar_export_id: validation.sidecar.export_id,
+        sidecar_created_at: validation.sidecar.created_at,
+      });
       return;
     }
     try {
@@ -1154,9 +1290,16 @@ router.get(
       );
       res.setHeader("Content-Length", String(st.size));
       res.setHeader("X-Export-Latest-Mtime", new Date(st.mtimeMs).toISOString());
+      res.setHeader("X-Export-Build-Marker", validation.sidecar.build_marker);
+      res.setHeader("X-Export-Sidecar-Export-Id", validation.sidecar.export_id);
       res.setHeader(
         "Access-Control-Expose-Headers",
-        ["Content-Disposition", "X-Export-Latest-Mtime"].join(", "),
+        [
+          "Content-Disposition",
+          "X-Export-Latest-Mtime",
+          "X-Export-Build-Marker",
+          "X-Export-Sidecar-Export-Id",
+        ].join(", "),
       );
       const stream = createReadStream(latestPath);
       stream.on("error", (err) => {
@@ -1190,8 +1333,40 @@ router.head(
       return;
     }
     const latestPath = userLatestZipPath(session.userId);
-    if (!existsSync(latestPath)) {
+    // Apply the same provenance gate as GET so the UI's "Download Latest"
+    // button only lights up when latest.zip is paired with a current
+    // sidecar. Detail surfaces in headers (HEAD has no body).
+    const validation = await validateLatestExport(session.userId);
+    if (validation.kind === "missing_zip") {
       res.status(404).end();
+      return;
+    }
+    if (
+      validation.kind === "missing_sidecar" ||
+      validation.kind === "malformed_sidecar"
+    ) {
+      res.setHeader("X-Export-Stale-Reason", "missing_or_malformed_sidecar");
+      res.setHeader("X-Export-Expected-Build-Marker", EXPORT_BUILD_MARKER);
+      res.setHeader(
+        "Access-Control-Expose-Headers",
+        ["X-Export-Stale-Reason", "X-Export-Expected-Build-Marker"].join(", "),
+      );
+      res.status(409).end();
+      return;
+    }
+    if (validation.kind === "stale_marker") {
+      res.setHeader("X-Export-Stale-Reason", "build_marker_mismatch");
+      res.setHeader("X-Export-Actual-Build-Marker", validation.actual);
+      res.setHeader("X-Export-Expected-Build-Marker", validation.expected);
+      res.setHeader(
+        "Access-Control-Expose-Headers",
+        [
+          "X-Export-Stale-Reason",
+          "X-Export-Actual-Build-Marker",
+          "X-Export-Expected-Build-Marker",
+        ].join(", "),
+      );
+      res.status(409).end();
       return;
     }
     try {
@@ -1199,9 +1374,18 @@ router.head(
       res.setHeader("Content-Type", "application/zip");
       res.setHeader("Content-Length", String(st.size));
       res.setHeader("X-Export-Latest-Mtime", new Date(st.mtimeMs).toISOString());
+      res.setHeader("X-Export-Build-Marker", validation.sidecar.build_marker);
+      res.setHeader(
+        "X-Export-Sidecar-Export-Id",
+        validation.sidecar.export_id,
+      );
       res.setHeader(
         "Access-Control-Expose-Headers",
-        "X-Export-Latest-Mtime",
+        [
+          "X-Export-Latest-Mtime",
+          "X-Export-Build-Marker",
+          "X-Export-Sidecar-Export-Id",
+        ].join(", "),
       );
       res.status(200).end();
     } catch {
