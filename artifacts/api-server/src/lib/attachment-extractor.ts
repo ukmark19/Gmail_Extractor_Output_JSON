@@ -219,6 +219,7 @@ async function ocrPdfPages(
   // Always await — `getDependencyReport()` returns null until the startup
   // probe completes, which would falsely surface as "pdftoppm missing".
   const deps = await ensureDependencyReport();
+  
   if (!deps?.pdftoppm.available) {
     return {
       pages: [],
