@@ -277,8 +277,12 @@ async function ocrPdfPages(
       const r = await runCommand(
         pdftoppmCmd,
         [
+          // 300 DPI (was 200) — sharper rasterisation gives tesseract
+          // a much better signal on small body text typical of scanned
+          // legal PDFs. Cost: ~2.25× image area, but the time cap below
+          // (120 s) is still comfortable for the OCR_MAX_PAGES window.
           "-r",
-          "200",
+          "300",
           "-f",
           "1",
           "-l",
@@ -337,7 +341,18 @@ async function ocrPdfPages(
       // ocr_images/<msg>/<att>/page_<n>.png in the export ZIP.
       pageImages.push({ pageNumber: i + 1, png: pngBuf });
       try {
-        const result = await recognize(pngBuf, "eng");
+        // tesseract.js options:
+        //   tessedit_pageseg_mode "6" — assume a single uniform block of
+        //     text. This is the right choice for scanned legal PDFs:
+        //     dense paragraphs, no multi-column layout heuristics, no
+        //     auto-orientation flailing on already-upright pages.
+        //   tessedit_ocr_engine_mode "1" — LSTM-only engine (skip the
+        //     legacy tesseract engine). Higher quality on body text and
+        //     significantly faster than mode 2 (LSTM + legacy combined).
+        const result = await recognize(pngBuf, "eng", {
+          tessedit_pageseg_mode: "6",
+          tessedit_ocr_engine_mode: "1",
+        });
         const pageText = (result.data.text || "").trim();
         pages.push({
           page_number: i + 1,
@@ -1962,12 +1977,22 @@ export async function extractAttachmentContent(
           if (ocrText.length === 0) {
             throw new Error("OCR returned no text");
           }
-          const ocrConfidence =
-            ocrText.length < 200
+          // Confidence thresholds tuned for the post-300DPI / LSTM-only
+          // OCR pipeline. We treat a non-empty result as ALWAYS usable:
+          //   < 50   chars → "low"    + "partial"  (e.g. signature block)
+          //   < 500  chars → "medium" + "partial"  (single-page memo)
+          //   ≥ 500  chars → "high"   + "success"  (multi-paragraph doc)
+          // The previous thresholds (200/2000) were calibrated for the
+          // 200 DPI / default-PSM pipeline and were too strict for the
+          // sharper single-block OCR output now produced.
+          const ocrConfidence: "low" | "medium" | "high" =
+            ocrText.length < 50
               ? "low"
-              : ocrText.length < 2000
+              : ocrText.length < 500
                 ? "medium"
                 : "high";
+          const ocrExtractionStatus: "partial" | "success" =
+            ocrConfidence === "high" ? "success" : "partial";
           warnings.push(
             `OCR fallback used (${ocr.pagesProcessed} page(s) OCR'd${
               ocr.pagesTotal && ocr.pagesTotal > ocr.pagesProcessed
@@ -1978,6 +2003,29 @@ export async function extractAttachmentContent(
           if (ocrConfidence === "low") {
             warnings.push("OCR text marked LOW CONFIDENCE.");
           }
+          // Surface the per-attachment OCR quality assessment into the
+          // processing log so operators can audit recogniser quality
+          // distribution across an export and tune thresholds without
+          // re-running the pipeline.
+          processingLog.push(
+            makeLogEntry(
+              messageId,
+              attachmentId,
+              filename,
+              "ocr_quality_assessed",
+              "success",
+              startTime,
+              {
+                extraction_method: "ocr",
+                error_message: JSON.stringify({
+                  ocr_text_length: ocrText.length,
+                  ocr_confidence: ocrConfidence,
+                  raster_dpi: 300,
+                  tesseract_pageseg_mode: "6",
+                }),
+              },
+            ),
+          );
           // Merge per-page OCR records into pages[]
           const mergedPages: PageRecord[] = [];
           const pageNoMap = new Map<number, PageRecord>();
@@ -2014,8 +2062,7 @@ export async function extractAttachmentContent(
               attachment_role: "document",
               is_supported: true,
               was_downloaded: true,
-              extraction_status:
-                ocrConfidence === "low" ? "partial" : "success",
+              extraction_status: ocrExtractionStatus,
               skip_reason: null,
               failure_category: null,
               failure_detail: null,
